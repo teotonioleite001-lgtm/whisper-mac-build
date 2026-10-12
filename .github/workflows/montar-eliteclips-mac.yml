@@ -30,8 +30,6 @@ jobs:
         with:
           node-version: "20"
 
-      # O runner do macOS NAO traz Go instalado ("go: command not found").
-      # O detector de rosto e escrito em Go, entao o compilador precisa vir aqui.
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23"
@@ -77,7 +75,6 @@ jobs:
           find /tmp/llama \( -name "llama-cli" -o -name "*.dylib" \) -exec cp {} resources/bin-mac/llm/ \;
           test -f resources/bin-mac/llm/llama-cli || { echo "ERRO: llama-cli nao veio"; exit 1; }
           chmod +x resources/bin-mac/llm/llama-cli
-          ls resources/bin-mac/llm | head -5
 
       - name: Compilar o detector de rosto
         working-directory: app
@@ -127,23 +124,37 @@ jobs:
           test $falhou -eq 0 || exit 1
           echo "todos os binarios conferidos"
 
+      - name: Ajustar a configuracao para o Mac
+        working-directory: app
+        run: |
+          set -euo pipefail
+          node -e "
+            const fs=require('fs');
+            const p=JSON.parse(fs.readFileSync('package.json','utf8'));
+            delete p.build.afterAllArtifactBuild;
+            delete p.build.win;
+            delete p.build.nsis;
+            fs.writeFileSync('package.json', JSON.stringify(p,null,2));
+            console.log('tirados: conferidor de assinatura do Windows, bloco win e nsis');
+          "
+
       - name: Montar o instalador
         working-directory: app
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npx electron-builder --mac --arm64 --publish never
 
-      - name: Conferir o programa montado
+      - name: Assinar o programa
         working-directory: app
         run: |
           set -euo pipefail
           APP=$(find dist -maxdepth 2 -name "EliteClips.app" | head -1)
           test -n "$APP" || { echo "ERRO: nao achei o EliteClips.app"; exit 1; }
-          echo "--- assinatura ---"
-          codesign -dv --verbose=2 "$APP" 2>&1 | head -6 || true
-          echo "--- binarios dentro do programa ---"
-          ls "$APP/Contents/Resources/bin"
-          echo "--- instalador ---"
+          codesign --force --deep --sign - "$APP"
+          codesign -dv --verbose=2 "$APP" 2>&1 | head -5 || true
+          echo "--- refazendo o instalador com o programa assinado ---"
+          rm -f dist/*.dmg dist/*.blockmap
+          npx electron-builder --mac --arm64 --prepackaged "$APP" --publish never
           ls -lh dist/*.dmg
 
       - name: Publicar o instalador
