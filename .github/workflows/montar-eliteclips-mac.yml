@@ -1,0 +1,141 @@
+name: Montar instalador do EliteClips para Mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      fonte:
+        description: "Endereco do codigo-fonte (temporario)"
+        required: true
+      whisper_tag:
+        description: "Tag do whisper.cpp"
+        required: true
+        default: "v1.9.5"
+
+jobs:
+  montar:
+    runs-on: macos-15
+
+    steps:
+      - name: Baixar o codigo do EliteClips
+        run: |
+          set -euo pipefail
+          mkdir -p app && cd app
+          curl -fsSL --retry 3 -o f.tar.gz "${{ inputs.fonte }}"
+          tar xzf f.tar.gz && rm f.tar.gz
+          node -p "'versao: ' + require('./package.json').version"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Instalar dependencias
+        working-directory: app
+        run: npm install --no-audit --no-fund
+
+      - name: Baixar ffmpeg e ffprobe
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p resources/bin-mac
+          for b in ffmpeg ffprobe; do
+            curl -fsSL --retry 3 -o "$b.zip" "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/$b.zip"
+            unzip -q -o "$b.zip" -d resources/bin-mac && rm "$b.zip"
+            chmod +x "resources/bin-mac/$b"
+          done
+          lipo -archs resources/bin-mac/ffmpeg
+
+      - name: Baixar yt-dlp e o motor de JavaScript
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p resources/bin-mac/js
+          curl -fsSL --retry 3 -o resources/bin-mac/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos
+          curl -fsSL --retry 3 -o resources/bin-mac/js/qjs https://github.com/quickjs-ng/quickjs/releases/download/v0.17.0/qjs-darwin-arm64
+          chmod +x resources/bin-mac/yt-dlp resources/bin-mac/js/qjs
+
+      - name: Baixar o llama.cpp
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p resources/bin-mac/llm
+          URL=$(curl -fsSL "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10" | grep -o 'https[^"]*bin-macos-arm64\.tar\.gz' | head -1)
+          test -n "$URL" || { echo "ERRO: nao achei release macos-arm64 do llama.cpp"; exit 1; }
+          echo "baixando $URL"
+          curl -fsSL --retry 3 -o llama.tgz "$URL"
+          mkdir -p /tmp/llama && tar xzf llama.tgz -C /tmp/llama
+          find /tmp/llama \( -name "llama-cli" -o -name "*.dylib" \) -exec cp {} resources/bin-mac/llm/ \;
+          chmod +x resources/bin-mac/llm/llama-cli
+          ls resources/bin-mac/llm | head -5
+
+      - name: Compilar o detector de rosto
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p resources/bin-mac/face
+          git clone --depth 1 --branch v1.4.6 https://github.com/esimov/pigo /tmp/pigo
+          cd /tmp/pigo
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$GITHUB_WORKSPACE/app/resources/bin-mac/face/pigo" ./cmd/pigo
+          cp cascade/facefinder "$GITHUB_WORKSPACE/app/resources/bin-mac/face/facefinder"
+          cp LICENSE "$GITHUB_WORKSPACE/app/resources/bin-mac/face/LICENSE-pigo.txt"
+          chmod +x "$GITHUB_WORKSPACE/app/resources/bin-mac/face/pigo"
+
+      - name: Compilar o whisper
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p resources/bin-mac/whisper
+          git clone --depth 1 --branch ${{ inputs.whisper_tag }} https://github.com/ggml-org/whisper.cpp /tmp/wh
+          cd /tmp/wh
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_ACCELERATE=ON -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON
+          cmake --build build -j"$(sysctl -n hw.ncpu)" --config Release
+          cp build/bin/whisper-cli "$GITHUB_WORKSPACE/app/resources/bin-mac/whisper/"
+          cp LICENSE "$GITHUB_WORKSPACE/app/resources/bin-mac/whisper/whisper.cpp-LICENSE.txt"
+          chmod +x "$GITHUB_WORKSPACE/app/resources/bin-mac/whisper/whisper-cli"
+
+      - name: Baixar o modelo de transcricao
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p resources/models
+          curl -fsSL --retry 3 -o resources/models/ggml-base.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+          ls -lh resources/models/ggml-base.bin
+
+      - name: Conferir que tudo e Apple Silicon
+        working-directory: app
+        run: |
+          set -euo pipefail
+          falhou=0
+          for f in $(find resources/bin-mac -type f); do
+            if file "$f" | grep -q "Mach-O"; then
+              lipo -archs "$f" | grep -qE "arm64" || { echo "ERRO: $f nao e arm64"; falhou=1; }
+              otool -L "$f" 2>/dev/null | grep -q "/opt/homebrew" && { echo "ERRO: $f depende do Homebrew"; falhou=1; }
+            fi
+          done
+          test $falhou -eq 0 || exit 1
+          echo "todos os binarios conferidos"
+
+      - name: Montar o instalador
+        working-directory: app
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --mac --arm64 --publish never
+
+      - name: Conferir o programa montado
+        working-directory: app
+        run: |
+          set -euo pipefail
+          APP=$(find dist -maxdepth 2 -name "EliteClips.app" | head -1)
+          test -n "$APP" || { echo "ERRO: nao achei o EliteClips.app"; exit 1; }
+          echo "--- assinatura ---"
+          codesign -dv --verbose=2 "$APP" 2>&1 | head -6 || true
+          echo "--- aceito pelo sistema? ---"
+          spctl -a -vvv "$APP" 2>&1 | head -4 || true
+          echo "--- instalador ---"
+          ls -lh dist/*.dmg
+
+      - name: Publicar o instalador
+        uses: actions/upload-artifact@v4
+        with:
+          name: EliteClips-mac-arm64
+          path: app/dist/*.dmg
+          retention-days: 30
