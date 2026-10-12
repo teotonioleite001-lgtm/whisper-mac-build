@@ -1,0 +1,245 @@
+name: Montar instalador do EliteTube para Mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      fonte:
+        description: "Endereco do codigo-fonte (temporario)"
+        required: true
+      whisper_tag:
+        description: "Tag do whisper.cpp"
+        required: true
+        default: "v1.9.5"
+
+jobs:
+  montar:
+    runs-on: macos-15
+    timeout-minutes: 120
+
+    steps:
+      - name: Baixar o codigo do EliteTube
+        run: |
+          set -euo pipefail
+          mkdir -p app && cd app
+          curl -fsSL --retry 3 -o f.tar.gz "${{ inputs.fonte }}"
+          tar xzf f.tar.gz && rm f.tar.gz
+          echo "versao: $(node -p "require('./package.json').version")"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Instalar dependencias
+        working-directory: app
+        run: npm install --no-audit --no-fund
+
+      - name: Tirar do package.json o que e so do Windows
+        working-directory: app
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            // afterAllArtifactBuild confere assinatura de DLL do Windows: no Mac derruba o build.
+            for (const k of ["win", "nsis", "afterAllArtifactBuild", "afterPack", "afterSign"]) delete p.build[k];
+            fs.writeFileSync("package.json", JSON.stringify(p, null, 2));
+            console.log("build limpo. appId segue:", p.build.appId, "| versao:", p.version);
+          '
+
+      - name: Baixar ffmpeg e ffprobe (arm64 estaticos)
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p resources/bin-mac
+          for b in ffmpeg ffprobe; do
+            curl -fsSL --retry 3 -o "$b.zip" \
+              "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/$b.zip"
+            unzip -q -o "$b.zip" -d resources/bin-mac && rm "$b.zip"
+            chmod +x "resources/bin-mac/$b"
+          done
+          lipo -archs resources/bin-mac/ffmpeg
+
+      - name: Compilar o whisper
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p resources/bin-mac/whisper
+          git clone --depth 1 --branch ${{ inputs.whisper_tag }} https://github.com/ggml-org/whisper.cpp /tmp/wh
+          cd /tmp/wh
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DGGML_ACCELERATE=ON -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON
+          cmake --build build -j"$(sysctl -n hw.ncpu)" --config Release
+          cp build/bin/whisper-cli "$GITHUB_WORKSPACE/app/resources/bin-mac/whisper/"
+          cp LICENSE "$GITHUB_WORKSPACE/app/resources/bin-mac/whisper/whisper.cpp-LICENSE.txt"
+          chmod +x "$GITHUB_WORKSPACE/app/resources/bin-mac/whisper/whisper-cli"
+
+      - name: Baixar o modelo de transcricao
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p resources/bin-mac/models
+          curl -fsSL --retry 3 -o resources/bin-mac/models/ggml-base.bin \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+          ls -lh resources/bin-mac/models/ggml-base.bin
+
+      - name: Baixar o Piper (voz masculina local)
+        working-directory: app
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/piper.tgz \
+            https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_macos_aarch64.tar.gz
+          mkdir -p /tmp/piperx && tar xzf /tmp/piper.tgz -C /tmp/piperx
+          SRC=$(find /tmp/piperx -maxdepth 3 -type f -name piper | head -1)
+          test -n "$SRC" || { echo "ERRO: nao achei o executavel piper no pacote"; exit 1; }
+          mkdir -p resources/bin-mac/piper
+          cp -R "$(dirname "$SRC")"/. resources/bin-mac/piper/
+          chmod +x resources/bin-mac/piper/piper
+          ls resources/bin-mac/piper
+
+      - name: Baixar a voz do Piper (pt-BR faber)
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p resources/bin-mac/vozes
+          BASE=https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium
+          curl -fsSL --retry 3 -o resources/bin-mac/vozes/pt_BR-faber-medium.onnx \
+            "$BASE/pt_BR-faber-medium.onnx"
+          curl -fsSL --retry 3 -o resources/bin-mac/vozes/pt_BR-faber-medium.onnx.json \
+            "$BASE/pt_BR-faber-medium.onnx.json"
+          # fichas das demais vozes: arquivos nossos, viajam no codigo-fonte
+          if ls resources/bin/vozes/*.voz.json >/dev/null 2>&1; then
+            cp resources/bin/vozes/*.voz.json resources/bin-mac/vozes/
+          else
+            echo "ERRO: nao vieram as fichas .voz.json no codigo-fonte"; exit 1
+          fi
+          ls -lh resources/bin-mac/vozes
+
+      - name: Baixar o modelo da voz feminina (Kokoro)
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p resources/bin-mac/kokoro
+          BASE=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+          curl -fsSL --retry 3 -o resources/bin-mac/kokoro/kokoro-v1.0.onnx "$BASE/kokoro-v1.0.onnx"
+          curl -fsSL --retry 3 -o resources/bin-mac/kokoro/voices-v1.0.bin  "$BASE/voices-v1.0.bin"
+          ls -lh resources/bin-mac/kokoro
+
+      - name: Montar o Python portatil da voz
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PADRAO='"browser_download_url": *"[^"]*cpython-3\.11\.[^"]*aarch64-apple-darwin-install_only\.tar\.gz"'
+          URL=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest" \
+                | grep -o "$PADRAO" | head -1 | sed 's/.*": *"//; s/"$//')
+          if [ -z "$URL" ]; then
+            echo "a ultima versao nao traz 3.11; procurando nas anteriores"
+            URL=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                  "https://api.github.com/repos/astral-sh/python-build-standalone/releases?per_page=12" \
+                  | grep -o "$PADRAO" | head -1 | sed 's/.*": *"//; s/"$//')
+          fi
+          test -n "$URL" || { echo "ERRO: nao achei Python 3.11 arm64 para Mac"; exit 1; }
+          echo "baixando $URL"
+          curl -fsSL --retry 3 -o /tmp/py.tgz "$URL"
+          mkdir -p /tmp/pyx && tar xzf /tmp/py.tgz -C /tmp/pyx
+          mv /tmp/pyx/python resources/bin-mac/pyvoz
+          # o programa procura <pyvoz>/python, sem extensao, igual ao Windows com .exe
+          ln -sf bin/python3 resources/bin-mac/pyvoz/python
+          ./resources/bin-mac/pyvoz/python -V
+
+      - name: Instalar as bibliotecas da voz
+        working-directory: app
+        run: |
+          set -euo pipefail
+          PY=./resources/bin-mac/pyvoz/python
+          "$PY" -m pip install --no-cache-dir --upgrade pip
+          "$PY" -m pip install --no-cache-dir \
+            "soundfile==0.14.0" "numpy==2.4.6" "kokoro-onnx==0.6.1" "edge-tts==7.2.8"
+          "$PY" -m pip list
+          # enxugar o que nao roda em producao
+          find resources/bin-mac/pyvoz -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
+          find resources/bin-mac/pyvoz -type d -name "tests" -prune -exec rm -rf {} + 2>/dev/null || true
+          du -sh resources/bin-mac/pyvoz
+
+      - name: Provar que a voz, o Piper e o whisper realmente funcionam
+        working-directory: app
+        run: |
+          set -euo pipefail
+          PY=./resources/bin-mac/pyvoz/python
+          echo "--- bibliotecas ---"
+          "$PY" -c "import soundfile, numpy, kokoro_onnx, edge_tts; print('bibliotecas ok')"
+
+          echo "--- voz feminina (Kokoro, local) ---"
+          printf 'Teste de voz da Elite A I Solutions.' | "$PY" engine-node/kokoro_synth.py \
+            resources/bin-mac/kokoro/kokoro-v1.0.onnx resources/bin-mac/kokoro/voices-v1.0.bin \
+            pf_dora pt-br 0.92 /tmp/kok.wav
+          T=$(stat -f%z /tmp/kok.wav)
+          echo "kokoro gerou $T bytes"
+          test "$T" -gt 20000 || { echo "ERRO: a voz feminina saiu vazia"; exit 1; }
+
+          echo "--- voz masculina (Piper, local) ---"
+          ( cd resources/bin-mac/piper && printf 'Teste de voz da Elite A I Solutions.' | ./piper \
+              --model ../vozes/pt_BR-faber-medium.onnx --output_file /tmp/pip.wav )
+          T=$(stat -f%z /tmp/pip.wav)
+          echo "piper gerou $T bytes"
+          test "$T" -gt 20000 || { echo "ERRO: a voz masculina saiu vazia"; exit 1; }
+
+          echo "--- transcricao (whisper) ---"
+          ./resources/bin-mac/whisper/whisper-cli -m resources/bin-mac/models/ggml-base.bin \
+            -f /tmp/pip.wav -l pt -nt 2>&1 | tail -5
+
+          echo "--- ffmpeg le e converte ---"
+          ./resources/bin-mac/ffmpeg -v error -y -i /tmp/kok.wav -c:a aac /tmp/kok.m4a
+          ./resources/bin-mac/ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/kok.m4a
+
+      - name: Conferir que tudo e Apple Silicon e nao depende do Homebrew
+        working-directory: app
+        run: |
+          set -euo pipefail
+          falhou=0
+          while IFS= read -r f; do
+            if file "$f" | grep -q "Mach-O"; then
+              if ! lipo -archs "$f" 2>/dev/null | grep -qE "arm64"; then
+                echo "ERRO: $f nao e arm64"; falhou=1
+              fi
+              if otool -L "$f" 2>/dev/null | grep -q "/opt/homebrew\|/usr/local/Cellar"; then
+                echo "ERRO: $f depende do Homebrew"; falhou=1
+              fi
+            fi
+          done < <(find resources/bin-mac -type f)
+          test $falhou -eq 0 || exit 1
+          echo "todos os binarios conferidos"
+          du -sh resources/bin-mac
+
+      - name: Montar o instalador
+        working-directory: app
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --mac --arm64 --publish never
+
+      - name: Assinar o programa e refazer o instalador
+        working-directory: app
+        run: |
+          set -euo pipefail
+          APP=$(find dist -maxdepth 2 -name "EliteTube.app" | head -1)
+          test -n "$APP" || { echo "ERRO: nao achei o EliteTube.app"; exit 1; }
+          # No Apple Silicon, programa sem assinatura e MORTO pelo sistema, sem aviso nenhum.
+          # Ad-hoc e de graca e basta para instalar e rodar; o certificado da Apple so e
+          # necessario para publicar sem o aviso de desenvolvedor nao identificado.
+          codesign --force --deep --sign - "$APP"
+          codesign -dv --verbose=2 "$APP" 2>&1 | head -4
+          echo "--- refazendo o .dmg com o programa ja assinado ---"
+          rm -f dist/*.dmg
+          npx electron-builder --mac --arm64 --prepackaged "$APP" --publish never
+          ls -lh dist/*.dmg
+
+      - name: Publicar o instalador
+        uses: actions/upload-artifact@v4
+        with:
+          name: EliteTube-mac-arm64
+          path: app/dist/*.dmg
+          retention-days: 30
