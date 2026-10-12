@@ -84,68 +84,22 @@ jobs:
             https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
           ls -lh resources/bin-mac/models/ggml-base.bin
 
-      - name: Baixar o Piper (voz masculina local)
-        working-directory: app
-        run: |
-          set -euo pipefail
-          curl -fsSL --retry 3 -o /tmp/piper.tgz \
-            https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_macos_aarch64.tar.gz
-          mkdir -p /tmp/piperx && tar xzf /tmp/piper.tgz -C /tmp/piperx
-          SRC=$(find /tmp/piperx -maxdepth 3 -type f -name piper | head -1)
-          test -n "$SRC" || { echo "ERRO: nao achei o executavel piper no pacote"; exit 1; }
-          mkdir -p resources/bin-mac/piper
-          cp -R "$(dirname "$SRC")"/. resources/bin-mac/piper/
-          chmod +x resources/bin-mac/piper/piper
-
-          # O pacote oficial do piper para Mac vem QUEBRADO: traz o executavel e os
-          # dados, mas nenhuma biblioteca. As tres que faltam (espeak-ng, onnxruntime
-          # e piper_phonemize) estao no pacote irmao piper-phonemize, do mesmo projeto,
-          # mesma data e mesma licenca. O .dSYM e so simbolo de depuracao: 7 MB que
-          # nao servem para nada no cliente.
-          curl -fsSL --retry 3 -o /tmp/ph.tgz \
-            https://github.com/rhasspy/piper-phonemize/releases/download/2023.11.14-4/piper-phonemize_macos_aarch64.tar.gz
-          mkdir -p /tmp/phx && tar xzf /tmp/ph.tgz -C /tmp/phx
-          LIB=$(find /tmp/phx -maxdepth 3 -type d -name lib | head -1)
-          test -n "$LIB" || { echo "ERRO: nao achei a pasta lib do piper-phonemize"; exit 1; }
-          cp -a "$LIB"/*.dylib resources/bin-mac/piper/
-          rm -rf resources/bin-mac/piper/*.dSYM
-          echo "--- bibliotecas copiadas ---"
-          ls -l resources/bin-mac/piper/*.dylib
-
-          # Sem isto o piper procura as bibliotecas em /usr/local/lib, nao acha, e o
-          # sistema aborta o programa. No Windows a DLL ao lado do .exe sempre e achada;
-          # no Mac e preciso dizer. Mexer no arquivo mata a assinatura, e no Apple
-          # Silicon binario sem assinatura nao roda: por isso cada um e reassinado.
-          cd resources/bin-mac/piper
-          install_name_tool -add_rpath @executable_path piper 2>/dev/null || true
-          codesign --force --sign - piper
-          for d in *.dylib; do
-            [ -e "$d" ] || continue
-            [ -L "$d" ] && continue      # atalho: quem vale e o arquivo de verdade
-            install_name_tool -add_rpath @loader_path "$d" 2>/dev/null || true
-            codesign --force --sign - "$d"
-          done
-          echo "--- o que o piper ainda procura fora da pasta ---"
-          otool -L piper | tail -n +2 | grep -v "@rpath" | grep -v "/usr/lib/" | grep -v "/System/" || true
-          cd "$GITHUB_WORKSPACE/app"
-
-      - name: Baixar a voz do Piper (pt-BR faber)
+      - name: Instalar as fichas de voz
         working-directory: app
         run: |
           set -euo pipefail
           mkdir -p resources/bin-mac/vozes
-          BASE=https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium
-          curl -fsSL --retry 3 -o resources/bin-mac/vozes/pt_BR-faber-medium.onnx \
-            "$BASE/pt_BR-faber-medium.onnx"
-          curl -fsSL --retry 3 -o resources/bin-mac/vozes/pt_BR-faber-medium.onnx.json \
-            "$BASE/pt_BR-faber-medium.onnx.json"
-          # fichas das demais vozes: arquivos nossos, viajam no codigo-fonte
+          # Sem Piper no Mac, nao ha .onnx para baixar: as vozes locais sao todas do
+          # Kokoro e as de nuvem sao do edge-tts. O que viaja aqui sao as FICHAS, que
+          # dizem ao programa qual motor e qual voz usar para cada nome da lista.
           if ls resources/bin/vozes/*.voz.json >/dev/null 2>&1; then
             cp resources/bin/vozes/*.voz.json resources/bin-mac/vozes/
           else
             echo "ERRO: nao vieram as fichas .voz.json no codigo-fonte"; exit 1
           fi
-          ls -lh resources/bin-mac/vozes
+          test -f resources/bin-mac/vozes/pt_BR-narrador.voz.json || {
+            echo "ERRO: falta a ficha da voz masculina (pt_BR-narrador.voz.json)"; exit 1; }
+          ls -l resources/bin-mac/vozes
 
       - name: Baixar o modelo da voz feminina (Kokoro)
         working-directory: app
@@ -196,7 +150,7 @@ jobs:
           find resources/bin-mac/pyvoz -type d -name "tests" -prune -exec rm -rf {} + 2>/dev/null || true
           du -sh resources/bin-mac/pyvoz
 
-      - name: Provar que a voz, o Piper e o whisper realmente funcionam
+      - name: Provar que as vozes e o whisper realmente funcionam
         working-directory: app
         run: |
           set -euo pipefail
@@ -212,16 +166,21 @@ jobs:
           echo "kokoro gerou $T bytes"
           test "$T" -gt 20000 || { echo "ERRO: a voz feminina saiu vazia"; exit 1; }
 
-          echo "--- voz masculina (Piper, local) ---"
-          # DE OUTRA PASTA e por caminho absoluto, com os mesmos parametros que o
-          # programa usa. Testar de dentro da pasta do piper escondia o defeito.
-          B="$GITHUB_WORKSPACE/app/resources/bin-mac"
-          ( cd /tmp && printf 'Teste de voz da Elite A I Solutions.' | "$B/piper/piper" \
-              -m "$B/vozes/pt_BR-faber-medium.onnx" --length_scale 1.08 \
-              --sentence_silence 0.4 -f /tmp/pip.wav )
+          echo "--- voz masculina (Kokoro pm_alex, local) ---"
+          printf 'Teste da voz masculina da Elite A I Solutions.' | "$PY" engine-node/kokoro_synth.py \
+            resources/bin-mac/kokoro/kokoro-v1.0.onnx resources/bin-mac/kokoro/voices-v1.0.bin \
+            pm_alex pt-br 0.92 /tmp/pip.wav
           T=$(stat -f%z /tmp/pip.wav)
-          echo "piper gerou $T bytes"
+          echo "voz masculina gerou $T bytes"
           test "$T" -gt 20000 || { echo "ERRO: a voz masculina saiu vazia"; exit 1; }
+
+          echo "--- as duas vozes sao MESMO diferentes ---"
+          # Mesma frase nas duas vozes gerando o mesmo arquivo seria sinal de que o
+          # nome da voz foi ignorado e tudo sai na mesma voz.
+          if cmp -s /tmp/kok.wav /tmp/pip.wav; then
+            echo "ERRO: feminina e masculina geraram audio identico"; exit 1
+          fi
+          echo "ok, saidas diferentes"
 
           echo "--- transcricao (whisper) ---"
           ./resources/bin-mac/whisper/whisper-cli -m resources/bin-mac/models/ggml-base.bin \
