@@ -30,6 +30,12 @@ jobs:
         with:
           node-version: "20"
 
+      # O runner do macOS NAO traz Go instalado ("go: command not found").
+      # O detector de rosto e escrito em Go, entao o compilador precisa vir aqui.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
       - name: Instalar dependencias
         working-directory: app
         run: npm install --no-audit --no-fund
@@ -77,10 +83,11 @@ jobs:
         working-directory: app
         run: |
           set -euo pipefail
+          go version
           mkdir -p resources/bin-mac/face
           git clone --depth 1 --branch v1.4.6 https://github.com/esimov/pigo /tmp/pigo
           cd /tmp/pigo
-          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$GITHUB_WORKSPACE/app/resources/bin-mac/face/pigo" ./cmd/pigo
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o "$GITHUB_WORKSPACE/app/resources/bin-mac/face/pigo" ./cmd/pigo
           cp cascade/facefinder "$GITHUB_WORKSPACE/app/resources/bin-mac/face/facefinder"
           cp LICENSE "$GITHUB_WORKSPACE/app/resources/bin-mac/face/LICENSE-pigo.txt"
           chmod +x "$GITHUB_WORKSPACE/app/resources/bin-mac/face/pigo"
