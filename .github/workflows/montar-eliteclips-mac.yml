@@ -14,6 +14,8 @@ on:
 jobs:
   montar:
     runs-on: macos-15
+    env:
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Baixar o codigo do EliteClips
@@ -58,12 +60,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p resources/bin-mac/llm
-          URL=$(curl -fsSL "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10" | grep -o 'https[^"]*bin-macos-arm64\.tar\.gz' | head -1)
-          test -n "$URL" || { echo "ERRO: nao achei release macos-arm64 do llama.cpp"; exit 1; }
+          URL=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10" | grep -o 'https[^"]*bin-macos-arm64\.tar\.gz' | head -1 || true)
+          if [ -z "$URL" ]; then
+            echo "AVISO: consulta a API falhou; usando a versao fixa conhecida"
+            URL="https://github.com/ggml-org/llama.cpp/releases/download/b11574/llama-b11574-bin-macos-arm64.tar.gz"
+          fi
           echo "baixando $URL"
           curl -fsSL --retry 3 -o llama.tgz "$URL"
           mkdir -p /tmp/llama && tar xzf llama.tgz -C /tmp/llama
           find /tmp/llama \( -name "llama-cli" -o -name "*.dylib" \) -exec cp {} resources/bin-mac/llm/ \;
+          test -f resources/bin-mac/llm/llama-cli || { echo "ERRO: llama-cli nao veio"; exit 1; }
           chmod +x resources/bin-mac/llm/llama-cli
           ls resources/bin-mac/llm | head -5
 
@@ -128,8 +134,8 @@ jobs:
           test -n "$APP" || { echo "ERRO: nao achei o EliteClips.app"; exit 1; }
           echo "--- assinatura ---"
           codesign -dv --verbose=2 "$APP" 2>&1 | head -6 || true
-          echo "--- aceito pelo sistema? ---"
-          spctl -a -vvv "$APP" 2>&1 | head -4 || true
+          echo "--- binarios dentro do programa ---"
+          ls "$APP/Contents/Resources/bin"
           echo "--- instalador ---"
           ls -lh dist/*.dmg
 
