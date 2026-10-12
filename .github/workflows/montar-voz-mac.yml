@@ -1,0 +1,150 @@
+name: Montar instalador do Elite Voz Eleven para Mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      fonte:
+        description: "Endereco do codigo-fonte (temporario)"
+        required: true
+      provar_motor:
+        description: "Provar o motor de voz antes de montar (demora ~15 min a mais)"
+        required: true
+        default: "sim"
+
+jobs:
+  montar:
+    runs-on: macos-15
+    timeout-minutes: 120
+
+    steps:
+      - name: Baixar o codigo do Voz Eleven
+        run: |
+          set -euo pipefail
+          mkdir -p app && cd app
+          curl -fsSL --retry 3 -o f.tar.gz "${{ inputs.fonte }}"
+          tar xzf f.tar.gz && rm f.tar.gz
+          echo "versao: $(node -p "require('./package.json').version")"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Instalar dependencias
+        working-directory: app
+        run: npm install --no-audit --no-fund
+
+      - name: Tirar do package.json o que e so do Windows
+        working-directory: app
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            // win traz a assinatura por certificado e afterAllArtifactBuild confere
+            // DLL assinada: as duas coisas derrubam o build no Mac.
+            for (const k of ["win","nsis","afterAllArtifactBuild","afterPack","afterSign"]) delete p.build[k];
+            fs.writeFileSync("package.json", JSON.stringify(p,null,2));
+            console.log("build limpo. appId segue:", p.build.appId, "| versao:", p.version);
+          '
+
+      - name: Baixar o ffmpeg (arm64 estatico)
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p resources/bin-mac
+          curl -fsSL --retry 3 -o ffmpeg.zip \
+            "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip"
+          unzip -q -o ffmpeg.zip -d resources/bin-mac && rm ffmpeg.zip
+          chmod +x resources/bin-mac/ffmpeg
+          lipo -archs resources/bin-mac/ffmpeg
+          ./resources/bin-mac/ffmpeg -version | head -1
+
+      - name: Provar que o motor de voz roda em Apple Silicon
+        if: ${{ inputs.provar_motor == 'sim' }}
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Monta o MESMO Python e instala as MESMAS bibliotecas que o programa instala
+          # na primeira abertura do cliente. Se alguma coisa nao existir para Apple
+          # Silicon, e melhor descobrir aqui do que no Mac de quem pagou.
+          PADRAO='"browser_download_url": *"[^"]*cpython-3\.11\.[^"]*aarch64-apple-darwin-install_only\.tar\.gz"'
+          URL=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest" \
+                | grep -o "$PADRAO" | head -1 | sed 's/.*": *"//; s/"$//')
+          if [ -z "$URL" ]; then
+            URL=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                  "https://api.github.com/repos/astral-sh/python-build-standalone/releases?per_page=12" \
+                  | grep -o "$PADRAO" | head -1 | sed 's/.*": *"//; s/"$//')
+          fi
+          test -n "$URL" || { echo "ERRO: nao achei Python 3.11 arm64 para Mac"; exit 1; }
+          curl -fsSL --retry 3 -o /tmp/py.tgz "$URL"
+          mkdir -p /tmp/rt && tar xzf /tmp/py.tgz -C /tmp/rt
+          PY=/tmp/rt/python/bin/python3
+          "$PY" -V
+          lipo -archs "$PY" || true
+
+          echo "--- instalando as bibliotecas de IA (os mesmos nomes do programa) ---"
+          "$PY" -m pip install --no-cache-dir --upgrade pip
+          "$PY" -m pip install --no-cache-dir \
+            chatterbox-tts truststore "setuptools<81" sentencepiece faster-whisper \
+            --find-links resources/wheels-fix \
+            --no-warn-script-location --disable-pip-version-check
+
+          echo "--- o torch roda de verdade nesta maquina? ---"
+          "$PY" -c "import torch, torchaudio; import torch.nn.functional as F; a=torch.randn(256,256); b=torch.randn(256,256); (a@b).sum(); F.conv1d(torch.randn(1,32,256), torch.randn(32,32,3), padding=1); torch.nn.functional.layer_norm(torch.randn(8,64),[64]); print('MOTOR_OK', torch.__version__, '| mps:', torch.backends.mps.is_available())"
+
+          echo "--- o motor de voz importa sem erro? ---"
+          "$PY" -c "import chatterbox; import faster_whisper; import sentencepiece; print('bibliotecas do motor ok')"
+
+          echo "--- quanto pesa o motor montado ---"
+          du -sh /tmp/rt
+
+      - name: Conferir que tudo e Apple Silicon e nao depende do Homebrew
+        working-directory: app
+        run: |
+          set -euo pipefail
+          falhou=0
+          while IFS= read -r f; do
+            if file "$f" | grep -q "Mach-O"; then
+              if ! lipo -archs "$f" 2>/dev/null | grep -qE "arm64"; then
+                echo "ERRO: $f nao e arm64"; falhou=1
+              fi
+              if otool -L "$f" 2>/dev/null | grep -q "/opt/homebrew\|/usr/local/Cellar"; then
+                echo "ERRO: $f depende do Homebrew"; falhou=1
+              fi
+            fi
+          done < <(find resources/bin-mac -type f)
+          test $falhou -eq 0 || exit 1
+          echo "todos os binarios conferidos"
+
+      - name: Montar o instalador
+        working-directory: app
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --mac --arm64 --publish never
+
+      - name: Assinar o programa e refazer o instalador
+        working-directory: app
+        run: |
+          set -euo pipefail
+          APP=$(find dist -maxdepth 2 -name "*.app" | head -1)
+          test -n "$APP" || { echo "ERRO: nao achei o .app montado"; exit 1; }
+          echo "programa: $APP"
+          # No Apple Silicon, programa sem assinatura e MORTO pelo sistema, sem aviso.
+          # Ad-hoc e de graca e basta para instalar e rodar; o certificado da Apple so
+          # e necessario para publicar sem o aviso de desenvolvedor nao identificado.
+          codesign --force --deep --sign - "$APP"
+          codesign -dv --verbose=2 "$APP" 2>&1 | head -4
+          echo "--- refazendo o .dmg com o programa ja assinado ---"
+          rm -f dist/*.dmg
+          npx electron-builder --mac --arm64 --prepackaged "$APP" --publish never
+          ls -lh dist/*.dmg
+
+      - name: Publicar o instalador
+        uses: actions/upload-artifact@v4
+        with:
+          name: EliteVozEleven-mac-arm64
+          path: app/dist/*.dmg
+          retention-days: 30
