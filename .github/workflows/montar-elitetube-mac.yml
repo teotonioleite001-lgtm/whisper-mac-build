@@ -96,20 +96,32 @@ jobs:
           mkdir -p resources/bin-mac/piper
           cp -R "$(dirname "$SRC")"/. resources/bin-mac/piper/
           chmod +x resources/bin-mac/piper/piper
-          ls resources/bin-mac/piper
 
-          # O piper do Mac procura as bibliotecas em @rpath, mas o pacote oficial vem
-          # SEM rpath apontando para a propria pasta: ele tenta /usr/local/lib, nao acha,
-          # e o sistema aborta o programa ("Library not loaded: libespeak-ng"). No Windows
-          # isso nao acontece porque a DLL ao lado do .exe sempre e encontrada. Aqui
-          # ensinamos cada arquivo a procurar ao lado de si mesmo. Mexer no binario mata
-          # a assinatura, e no Apple Silicon binario sem assinatura nao roda: por isso
-          # cada um e reassinado na hora.
+          # O pacote oficial do piper para Mac vem QUEBRADO: traz o executavel e os
+          # dados, mas nenhuma biblioteca. As tres que faltam (espeak-ng, onnxruntime
+          # e piper_phonemize) estao no pacote irmao piper-phonemize, do mesmo projeto,
+          # mesma data e mesma licenca. O .dSYM e so simbolo de depuracao: 7 MB que
+          # nao servem para nada no cliente.
+          curl -fsSL --retry 3 -o /tmp/ph.tgz \
+            https://github.com/rhasspy/piper-phonemize/releases/download/2023.11.14-4/piper-phonemize_macos_aarch64.tar.gz
+          mkdir -p /tmp/phx && tar xzf /tmp/ph.tgz -C /tmp/phx
+          LIB=$(find /tmp/phx -maxdepth 3 -type d -name lib | head -1)
+          test -n "$LIB" || { echo "ERRO: nao achei a pasta lib do piper-phonemize"; exit 1; }
+          cp -a "$LIB"/*.dylib resources/bin-mac/piper/
+          rm -rf resources/bin-mac/piper/*.dSYM
+          echo "--- bibliotecas copiadas ---"
+          ls -l resources/bin-mac/piper/*.dylib
+
+          # Sem isto o piper procura as bibliotecas em /usr/local/lib, nao acha, e o
+          # sistema aborta o programa. No Windows a DLL ao lado do .exe sempre e achada;
+          # no Mac e preciso dizer. Mexer no arquivo mata a assinatura, e no Apple
+          # Silicon binario sem assinatura nao roda: por isso cada um e reassinado.
           cd resources/bin-mac/piper
           install_name_tool -add_rpath @executable_path piper 2>/dev/null || true
           codesign --force --sign - piper
-          for d in *.dylib *.so; do
+          for d in *.dylib; do
             [ -e "$d" ] || continue
+            [ -L "$d" ] && continue      # atalho: quem vale e o arquivo de verdade
             install_name_tool -add_rpath @loader_path "$d" 2>/dev/null || true
             codesign --force --sign - "$d"
           done
