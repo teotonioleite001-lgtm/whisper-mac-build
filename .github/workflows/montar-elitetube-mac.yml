@@ -98,6 +98,25 @@ jobs:
           chmod +x resources/bin-mac/piper/piper
           ls resources/bin-mac/piper
 
+          # O piper do Mac procura as bibliotecas em @rpath, mas o pacote oficial vem
+          # SEM rpath apontando para a propria pasta: ele tenta /usr/local/lib, nao acha,
+          # e o sistema aborta o programa ("Library not loaded: libespeak-ng"). No Windows
+          # isso nao acontece porque a DLL ao lado do .exe sempre e encontrada. Aqui
+          # ensinamos cada arquivo a procurar ao lado de si mesmo. Mexer no binario mata
+          # a assinatura, e no Apple Silicon binario sem assinatura nao roda: por isso
+          # cada um e reassinado na hora.
+          cd resources/bin-mac/piper
+          install_name_tool -add_rpath @executable_path piper 2>/dev/null || true
+          codesign --force --sign - piper
+          for d in *.dylib *.so; do
+            [ -e "$d" ] || continue
+            install_name_tool -add_rpath @loader_path "$d" 2>/dev/null || true
+            codesign --force --sign - "$d"
+          done
+          echo "--- o que o piper ainda procura fora da pasta ---"
+          otool -L piper | tail -n +2 | grep -v "@rpath" | grep -v "/usr/lib/" | grep -v "/System/" || true
+          cd "$GITHUB_WORKSPACE/app"
+
       - name: Baixar a voz do Piper (pt-BR faber)
         working-directory: app
         run: |
@@ -182,8 +201,12 @@ jobs:
           test "$T" -gt 20000 || { echo "ERRO: a voz feminina saiu vazia"; exit 1; }
 
           echo "--- voz masculina (Piper, local) ---"
-          ( cd resources/bin-mac/piper && printf 'Teste de voz da Elite A I Solutions.' | ./piper \
-              --model ../vozes/pt_BR-faber-medium.onnx --output_file /tmp/pip.wav )
+          # DE OUTRA PASTA e por caminho absoluto, com os mesmos parametros que o
+          # programa usa. Testar de dentro da pasta do piper escondia o defeito.
+          B="$GITHUB_WORKSPACE/app/resources/bin-mac"
+          ( cd /tmp && printf 'Teste de voz da Elite A I Solutions.' | "$B/piper/piper" \
+              -m "$B/vozes/pt_BR-faber-medium.onnx" --length_scale 1.08 \
+              --sentence_silence 0.4 -f /tmp/pip.wav )
           T=$(stat -f%z /tmp/pip.wav)
           echo "piper gerou $T bytes"
           test "$T" -gt 20000 || { echo "ERRO: a voz masculina saiu vazia"; exit 1; }
