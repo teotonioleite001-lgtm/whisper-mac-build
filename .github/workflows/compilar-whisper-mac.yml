@@ -1,0 +1,80 @@
+name: Compilar whisper para Mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag do whisper.cpp a compilar"
+        required: true
+        default: "v1.9.5"
+
+jobs:
+  compilar:
+    runs-on: macos-15
+
+    steps:
+      - name: Baixar o codigo do whisper.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ inputs.tag }}
+          path: whisper.cpp
+
+      - name: Compilar
+        working-directory: whisper.cpp
+        run: |
+          set -euo pipefail
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DGGML_ACCELERATE=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON
+          cmake --build build -j"$(sysctl -n hw.ncpu)" --config Release
+
+      - name: Conferir o que saiu
+        working-directory: whisper.cpp
+        run: |
+          set -euo pipefail
+          BIN=build/bin/whisper-cli
+          test -f "$BIN" || { echo "ERRO: whisper-cli nao foi gerado"; exit 1; }
+          echo "--- arquitetura (tem de dizer arm64) ---"
+          lipo -archs "$BIN"
+          lipo -archs "$BIN" | grep -qw arm64 || { echo "ERRO: nao e arm64"; exit 1; }
+          echo "--- dependencias (so /usr/lib e /System/Library sao aceitaveis) ---"
+          otool -L "$BIN"
+          if otool -L "$BIN" | grep -q "/opt/homebrew"; then
+            echo "ERRO: binario depende do Homebrew; nao serve para distribuir"; exit 1
+          fi
+          echo "--- tamanho ---"
+          ls -lh "$BIN"
+
+      - name: Assinar
+        working-directory: whisper.cpp
+        run: |
+          set -euo pipefail
+          codesign --force --sign - build/bin/whisper-cli
+          codesign -dv --verbose=2 build/bin/whisper-cli 2>&1 | head -5
+
+      - name: Juntar o binario e a licenca
+        run: |
+          set -euo pipefail
+          mkdir -p saida
+          cp whisper.cpp/build/bin/whisper-cli saida/
+          cp whisper.cpp/LICENSE saida/whisper.cpp-LICENSE.txt
+          cd saida
+          shasum -a 256 whisper-cli > whisper-cli.sha256
+          cat whisper-cli.sha256
+
+      - name: Publicar o resultado
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-cli-macos-arm64-${{ inputs.tag }}
+          path: saida/
+          retention-days: 30
