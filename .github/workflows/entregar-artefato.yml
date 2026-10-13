@@ -1,0 +1,79 @@
+name: Entregar artefato por link direto
+
+# POR QUE EXISTE: o artefato de um workflow so baixa com autenticacao, e o
+# navegador desta maquina parou de completar downloads grandes. Este workflow pega
+# o artefato de uma montagem que ja terminou e o publica como "release" do
+# repositorio, que tem endereco direto e aberto -- da para baixar por linha de
+# comando, conferir a soma e levar para o nosso servidor.
+#
+# O RELEASE E TEMPORARIO. Fica no ar os minutos da transferencia e e apagado
+# em seguida, pelo proprio fluxo de trabalho (ou pela mao, com o passo abaixo).
+# Nao e canal de distribuicao: e uma ponte.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Numero da montagem (run id) que tem o artefato"
+        required: true
+      nome:
+        description: "Nome do artefato (ex.: EliteTube-mac-arm64)"
+        required: true
+      apagar:
+        description: "Apagar a ponte anterior antes de criar a nova (sim/nao)"
+        required: true
+        default: "sim"
+
+permissions:
+  contents: write      # criar e apagar o release
+  actions: read        # ler o artefato da outra montagem
+
+jobs:
+  entregar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Pegar o artefato da montagem
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.nome }}
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: entrega
+
+      - name: Conferir o que veio
+        run: |
+          set -euo pipefail
+          ls -lh entrega/
+          echo "--- somas ---"
+          cd entrega && sha256sum * | tee ../SOMAS.txt
+
+      - name: Apagar a ponte anterior
+        if: ${{ inputs.apagar == 'sim' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # nao falha se nao existir: a primeira vez nao tem o que apagar
+          gh release delete ponte --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          sleep 3
+
+      - name: Publicar a ponte
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create ponte --repo "$GITHUB_REPOSITORY" \
+            --title "Ponte de transferencia (temporaria)" \
+            --notes "Arquivo em transito para o servidor da Elite. Apagado logo apos a copia." \
+            entrega/* SOMAS.txt
+          echo "--- enderecos diretos ---"
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/ponte"
+          cd entrega
+          for f in *; do
+            # o espaco no nome vira %20 no endereco
+            enc=$(printf '%s' "$f" | sed 's/ /%20/g')
+            echo "$BASE/$enc"
+          done
+          echo "$BASE/SOMAS.txt"
