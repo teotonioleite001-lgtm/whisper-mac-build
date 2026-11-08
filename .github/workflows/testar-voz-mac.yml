@@ -1,0 +1,81 @@
+name: Testar voz clonada no Mac
+
+# Mede, num Mac Apple Silicon de verdade, o caminho EXATO da narracao com a voz gravada
+# pelo Membro: mesmo instalador do motor, mesmo python, mesmo worker, mesmo modulo.
+# Nasceu do caso Edgard (MacBook M4, 08/11/2026): a montagem parou 30 min em "a narracao".
+
+on:
+  workflow_dispatch:
+    inputs:
+      fonte:
+        description: "Endereco do pacote de teste (temporario)"
+        required: true
+      fase2:
+        description: "Rodar tambem pelo modulo real (sim/nao)"
+        required: true
+        default: "sim"
+
+jobs:
+  testar:
+    runs-on: macos-15
+    timeout-minutes: 110
+
+    steps:
+      - name: Maquina
+        run: |
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl hw.ncpu hw.memsize hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu 2>/dev/null || true
+          sw_vers
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Baixar o pacote de teste
+        run: |
+          set -euo pipefail
+          mkdir -p t && cd t
+          curl -fsSL --retry 3 -o t.tar.gz "${{ inputs.fonte }}"
+          tar xzf t.tar.gz && rm t.tar.gz
+          ls -la . engine-node engine-node/python
+
+      - name: Instalar o motor de clonagem (o mesmo caminho do Membro)
+        working-directory: t
+        run: |
+          set -euo pipefail
+          time node engine-node/instalar-motor-voz.js "$HOME/motor-voz" clone
+          ls -la "$HOME/motor-voz/cbox/onnx"
+          "$HOME/motor-voz/python/bin/python3" -c "import onnxruntime as o, tokenizers as t, numpy as n; print('onnxruntime', o.__version__, '| tokenizers', t.__version__, '| numpy', n.__version__, '| providers', o.get_available_providers())"
+
+      - name: Gravar a amostra (voz do proprio Mac, pt-BR, 24 kHz mono)
+        run: |
+          set -euo pipefail
+          V=Luciana
+          say -v '?' | grep -q '^Luciana' || V=$(say -v '?' | grep -m1 'pt_BR' | awk '{print $1}')
+          [ -n "$V" ] || V=Samantha
+          echo "voz do sistema: $V"
+          say -v "$V" -o amostra.aiff "Olá, este é um teste de gravação da minha voz para o programa. Eu estou falando de forma natural e com calma, para que a clonagem capture o meu timbre, o meu ritmo e a minha entonação. Vamos ver como fica a narração com a minha própria voz."
+          afconvert -f WAVE -d LEI16@24000 -c 1 amostra.aiff amostra.wav
+          afinfo amostra.wav | grep -iE 'duration|format' || true
+
+      - name: Fase 1 - o motor direto, com tudo visivel
+        working-directory: t
+        continue-on-error: true
+        run: node teste-voz-mac.js direto "$HOME/motor-voz" "$GITHUB_WORKSPACE/amostra.wav" "$GITHUB_WORKSPACE/saida1"
+
+      - name: Fase 2 - pelo modulo real (narrar-vozpack.js --lote)
+        if: inputs.fase2 == 'sim'
+        working-directory: t
+        run: node teste-voz-mac.js modulo "$HOME/motor-voz" "$GITHUB_WORKSPACE/amostra.wav" "$GITHUB_WORKSPACE/saida2"
+
+      - name: Guardar os audios
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: voz-mac-audios
+          path: |
+            amostra.wav
+            saida1
+            saida2
+          retention-days: 3
+          if-no-files-found: ignore
