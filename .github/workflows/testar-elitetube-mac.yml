@@ -2,10 +2,13 @@ name: Testar o EliteTube no Mac (video inteiro)
 
 # Gera um video DE VERDADE num Mac Apple Silicon, com o MESMO .dmg que o Membro baixa:
 # instala o motor de imagem e o de clonagem pelo proprio programa, grava uma voz de teste
-# (como o "Gravar minha voz") e pede um video de ~1 minuto (12 cenas), do jeito que a tela
-# pede. Nasceu do caso Edgard (MacBook M4, 08/11/2026): na 4.0.3 a narracao passou e veio
-# "nao consegui montar o video". Ate esta data NINGUEM tinha visto o EliteTube terminar um
-# video inteiro num Mac.
+# (como o "Gravar minha voz") e pede um video, do jeito que a tela pede. Nasceu do caso
+# Edgard (MacBook M4, 08/11/2026): na 4.0.3 veio "nao consegui montar o video".
+#
+# ATUALIZAR POR CIMA (09/11/2026). A rodada 4 fez o video inteiro com o programa recem
+# instalado. O Edgard NAO estava nesse caso: ele instalou os motores numa versao e depois
+# trocou o EliteTube.app pela versao nova. Com `atualizar = sim` o teste faz exatamente
+# isso: instala os motores, fecha o programa, apaga o .app e poe o do `dmg_novo` no lugar.
 
 on:
   # dispara sozinho quando este arquivo chega ao repositorio (sem precisar do botao)
@@ -15,21 +18,42 @@ on:
   workflow_dispatch:
     inputs:
       dmg:
-        description: "Endereco do .dmg"
+        description: "Endereco do .dmg instalado primeiro (onde os motores sao baixados)"
         required: true
         default: "https://loja.eliteaisolutions.app.br/storage/updates/elitetube/EliteTube-latest-mac.dmg"
+      dmg_novo:
+        description: "Endereco do .dmg que entra POR CIMA (vazio = o mesmo)"
+        required: false
+        default: ""
+      atualizar:
+        description: "Atualizar o programa por cima depois de instalar os motores (sim/nao)"
+        required: true
+        default: "sim"
       motor:
         description: "Motor de imagem: sd15 (o do Membro) ou leve (rapido)"
         required: true
-        default: "sd15"
+        default: "leve"
       voz:
         description: "Voz: minha (gravada, clonagem) ou local"
         required: true
         default: "minha"
+      paragrafos:
+        description: "Quantos paragrafos do roteiro de teste (1 a 12)"
+        required: true
+        default: "4"
       conserto_python:
         description: "Aplicar o conserto do python do motor de imagem (sim/nao)"
         required: true
         default: "sim"
+
+env:
+  DMG1: ${{ inputs.dmg || 'https://loja.eliteaisolutions.app.br/storage/updates/elitetube/EliteTube-latest-mac.dmg' }}
+  DMG2: ${{ inputs.dmg_novo || inputs.dmg || 'https://loja.eliteaisolutions.app.br/storage/updates/elitetube/EliteTube-latest-mac.dmg' }}
+  ATUALIZAR: ${{ inputs.atualizar || 'sim' }}
+  MOTOR: ${{ inputs.motor || 'leve' }}
+  VOZ: ${{ inputs.voz || 'minha' }}
+  PARAGRAFOS: ${{ inputs.paragrafos || '4' }}
+  CONSERTO: ${{ inputs.conserto_python || 'sim' }}
 
 jobs:
   e2e:
@@ -47,39 +71,75 @@ jobs:
           sysctl hw.ncpu hw.memsize 2>/dev/null || true
           sw_vers
           df -h / | tail -1
+          echo "dmg1=$DMG1"; echo "dmg2=$DMG2"; echo "atualizar=$ATUALIZAR motor=$MOTOR voz=$VOZ paragrafos=$PARAGRAFOS conserto=$CONSERTO"
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Baixar o EliteTube (o mesmo .dmg da area de membros)
+      - name: Escrever o instalador do .app (o mesmo para instalar e para atualizar)
         run: |
-          exec > >(tee -a /tmp/e2e/passos.txt) 2>&1
+          cat > /tmp/instalar-app.sh <<'SH'
+          #!/bin/bash
+          # Poe o EliteTube.app de um .dmg no lugar do que houver, como o Membro faz ao
+          # atualizar: o .app velho sai INTEIRO e o novo entra. Os dados (motores, vozes,
+          # projetos) ficam em ~/Library/Application Support/EliteTube e nao sao tocados.
           set -euo pipefail
-          curl -fsSL --retry 3 -o /tmp/et.dmg "${{ inputs.dmg || 'https://loja.eliteaisolutions.app.br/storage/updates/elitetube/EliteTube-latest-mac.dmg' }}"
+          URL="$1"
+          curl -fsSL --retry 3 -o /tmp/et.dmg "$URL"
           ls -la /tmp/et.dmg
           shasum -a 256 /tmp/et.dmg
-          hdiutil attach -nobrowse -readonly -mountpoint /Volumes/ET /tmp/et.dmg
-          ls /Volumes/ET
+          hdiutil attach -nobrowse -readonly -mountpoint /Volumes/ET /tmp/et.dmg >/dev/null
+          rm -rf "$HOME/EliteTube.app"
           cp -R /Volumes/ET/*.app "$HOME/EliteTube.app"
-          hdiutil detach /Volumes/ET
+          hdiutil detach /Volumes/ET >/dev/null
           rm -f /tmp/et.dmg
           echo "versao: $(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$HOME/EliteTube.app/Contents/Info.plist")"
-          ls "$HOME/EliteTube.app/Contents/Resources"
           M="$HOME/EliteTube.app/Contents/Resources/app/main.js"
-          grep -n "const EXIGIR_LICENCA = true;" "$M"
           sed -i "" "s/const EXIGIR_LICENCA = true;/const EXIGIR_LICENCA = false;/" "$M"
           grep -n "const EXIGIR_LICENCA" "$M"
-          # CONSERTO EM TESTE (09/11): o instalador do motor de imagem copia o python da voz
-          # com fs.cpSync, e sem verbatimSymlinks os links viram caminhos ABSOLUTOS para dentro
-          # do .app: o torch ia parar dentro do EliteTube.app e o motor nunca era achado.
+          # CONSERTO EM TESTE (09/11): so faz efeito na 4.0.3; na 4.0.4 o fonte ja vem certo
           I="$HOME/EliteTube.app/Contents/Resources/app/engine-node/instalar-motor-imagem.js"
-          if [ "${{ inputs.conserto_python || 'sim' }}" = "sim" ]; then
+          if [ "$CONSERTO" = "sim" ]; then
             sed -i "" "s/fs.cpSync(_emb, pyDir, { recursive: true, force: true });/fs.cpSync(_emb, pyDir, { recursive: true, force: true, verbatimSymlinks: true });/" "$I"
           fi
-          grep -n "fs.cpSync(_emb" "$I"
-          ls -la "$HOME/EliteTube.app/Contents/Resources/bin/pyvoz/bin" | head -8
-          codesign --force --deep --sign - "$HOME/EliteTube.app" && echo "reassinado (ad-hoc) so neste Mac de teste"
+          grep -n "fs.cpSync(_emb" "$I" || true
+          codesign --force --deep --sign - "$HOME/EliteTube.app" >/dev/null 2>&1 && echo "reassinado (ad-hoc) so neste Mac de teste"
+          SH
+          chmod +x /tmp/instalar-app.sh
+          cat > /tmp/abrir-app.sh <<'SH'
+          #!/bin/bash
+          # Fecha o que houver aberto e abre o EliteTube; espera o servidor da tela responder.
+          pkill -f "EliteTube.app/Contents/MacOS/EliteTube" || true; sleep 5
+          pkill -9 -f "EliteTube.app/Contents" || true; sleep 2
+          nohup "$HOME/EliteTube.app/Contents/MacOS/EliteTube" >> /tmp/app.out 2>&1 &
+          for i in $(seq 1 150); do
+            if curl -sf -o /dev/null http://127.0.0.1:47615/gerar_status; then echo "servidor no ar em ~$((i*2)) s"; exit 0; fi
+            sleep 2
+          done
+          echo "O MOTOR NAO SUBIU"; ps aux | grep -i elitetube | grep -v grep | head; tail -n 60 /tmp/app.out
+          tail -n 80 "$HOME/Library/Application Support/EliteTube/elitetube.log" 2>/dev/null
+          exit 1
+          SH
+          chmod +x /tmp/abrir-app.sh
+          cat > /tmp/olhar-motor-voz.sh <<'SH'
+          #!/bin/bash
+          # Para onde aponta o python do motor de voz, e se ele abre as bibliotecas da clonagem.
+          V="$HOME/Library/Application Support/EliteTube/motor-voz"
+          [ -d "$V/python" ] || { echo "(sem $V/python)"; exit 0; }
+          ls -la "$V/python" | head -8
+          ls -la "$V/python/bin" | grep -E " python" | head -4
+          P="$V/python/bin/python3"
+          echo "realpath: $(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$P" 2>/dev/null)"
+          "$P" -c "import sys, tokenizers, soxr, onnxruntime; print('IMPORTA OK  prefix=' + sys.prefix)" 2>&1 | tail -2 || true
+          SH
+          chmod +x /tmp/olhar-motor-voz.sh
+          echo ok
+
+      - name: Baixar e instalar o EliteTube (o mesmo .dmg da area de membros)
+        run: |
+          exec > >(tee -a /tmp/e2e/passos.txt) 2>&1
+          /tmp/instalar-app.sh "$DMG1"
 
       - name: Gravar a voz de teste (igual ao "Gravar minha voz")
         run: |
@@ -99,19 +159,9 @@ jobs:
         run: |
           exec > >(tee -a /tmp/e2e/passos.txt) 2>&1
           set -euo pipefail
-          nohup "$HOME/EliteTube.app/Contents/MacOS/EliteTube" > /tmp/app.out 2>&1 &
-          echo $! > /tmp/app.pid
-          for i in $(seq 1 150); do
-            if curl -sf -o /dev/null http://127.0.0.1:47615/gerar_status; then echo "servidor no ar em ~$((i*2)) s"; break; fi
-            sleep 2
-          done
-          if ! curl -sf http://127.0.0.1:47615/gerar_status > /tmp/st.json; then
-            echo "O MOTOR NAO SUBIU"; ps aux | grep -i elitetube | grep -v grep | head; tail -n 60 /tmp/app.out
-            tail -n 80 "$HOME/Library/Application Support/EliteTube/elitetube.log" 2>/dev/null; ls -la ~/Library/Logs/DiagnosticReports 2>/dev/null | tail -5; exit 1
-          fi
-          head -c 300 /tmp/st.json; echo
+          /tmp/abrir-app.sh
           curl -sf http://127.0.0.1:47615/vozes > /tmp/vozes.json
-          node -e 'const d=require("/tmp/vozes.json"); const v=d.vozes||d; console.log(v.length,"vozes"); for (const x of v) console.log("  "+x.id+" | "+(x.nome||"")+(x.minha?" | MINHA":"")+(x.bloqueada?" | bloqueada":""))'
+          node -e 'const d=require("/tmp/vozes.json"); const v=d.vozes||d; console.log(v.length,"vozes"); for (const x of v) if (x.minha || /local/.test(x.nome||"")) console.log("  "+x.id+" | "+(x.nome||"")+(x.minha?" | MINHA":""))'
 
       - name: Escrever o roteiro de teste e o piloto
         run: |
@@ -119,7 +169,8 @@ jobs:
           cat > /tmp/e2e/piloto.js <<'JS'
           // Fala com o EliteTube pelo MESMO endereco que a tela usa.
           const http = require('http');
-          const MOTOR = process.env.MOTOR || 'sd15', VOZ = process.env.VOZ || 'minha', FASE = process.argv[2];
+          const MOTOR = process.env.MOTOR || 'leve', VOZ = process.env.VOZ || 'minha', FASE = process.argv[2];
+          const PARAGRAFOS = Math.max(1, Math.min(12, parseInt(process.env.PARAGRAFOS, 10) || 12));
           const t0 = Date.now(), min = () => ((Date.now() - t0) / 60000).toFixed(1).padStart(5) + ' min';
           function req(m, p, b) { return new Promise(ok => {
             const d = b ? Buffer.from(JSON.stringify(b)) : null;
@@ -151,7 +202,7 @@ jobs:
             const v = await req('GET', '/vozes'); const vozes = (v && v.vozes) || [];
             const voz = VOZ === 'minha' ? vozes.find(x => x.minha) : (vozes.find(x => x.padrao && !x.minha && !x.bloqueada) || vozes.find(x => !x.minha && !x.bloqueada));
             if (!voz) { console.log('nao achei a voz', VOZ); return 4; }
-            console.log(min(), 'voz:', voz.id, '|', voz.nome, '| motor de imagem:', MOTOR);
+            console.log(min(), 'voz:', voz.id, '|', voz.nome, '| motor de imagem:', MOTOR, '| paragrafos:', PARAGRAFOS);
             const roteiro = [
               'Você já parou para pensar quanto tempo perde todos os dias com tarefas repetitivas?',
               'Hoje eu vou mostrar três hábitos simples que mudam completamente a sua produtividade.',
@@ -165,7 +216,7 @@ jobs:
               'Você vai terminar o dia com mais tempo e menos cansaço.',
               'Comece hoje mesmo, com um hábito de cada vez.',
               'E me conte nos comentários qual deles você vai testar primeiro.',
-            ].join('\n\n');
+            ].slice(0, PARAGRAFOS).join('\n\n');
             const g = await req('POST', '/gerar', { roteiro, audio: 'elitetube', vertical: false, quadrado: false, estilo: '',
               legenda: 'elite', motor_img: MOTOR, mistura: null, reusar_imagens: false, voz: voz.id, modo: null, avatar: null, transicao: '' });
             console.log(min(), '/gerar:', JSON.stringify(g).slice(0, 300));
@@ -188,34 +239,43 @@ jobs:
           echo ok
 
       - name: Instalar os motores pelo proprio programa
-        env:
-          MOTOR: ${{ inputs.motor || 'sd15' }}
-          VOZ: ${{ inputs.voz || 'minha' }}
         run: |
           exec > >(tee -a /tmp/e2e/passos.txt) 2>&1
           node /tmp/e2e/piloto.js motores
+          echo "=== o python do motor de voz, recem instalado"
+          /tmp/olhar-motor-voz.sh
 
-      - name: Conferir o motor de imagem e reabrir o programa (como o Membro faz)
+      - name: Atualizar o programa por cima (como o Membro faz)
+        run: |
+          exec > >(tee -a /tmp/e2e/passos.txt) 2>&1
+          if [ "$ATUALIZAR" != "sim" ]; then echo "(sem atualizacao nesta rodada)"; exit 0; fi
+          pkill -f "EliteTube.app/Contents/MacOS/EliteTube" || true; sleep 5; pkill -9 -f "EliteTube.app/Contents" || true; sleep 2
+          /tmp/instalar-app.sh "$DMG2"
+          echo "=== o python do motor de voz, DEPOIS de trocar o .app"
+          /tmp/olhar-motor-voz.sh
+
+      - name: Conferir os motores e reabrir o programa (como o Membro faz)
         run: |
           exec > >(tee -a /tmp/e2e/passos.txt) 2>&1
           U="$HOME/Library/Application Support/EliteTube"
           echo "=== onde ficaram os motores"; ls "$U"
-          for M in "$U/motor-imagem" "$U/engine/motor-imagem"; do [ -d "$M" ] || continue; echo "--- $M"; ls "$M" "$M/python" "$M/python/bin" 2>/dev/null | head -40
-            ls -d "$M"/python/lib/python*/site-packages 2>/dev/null
+          for M in "$U/motor-imagem" "$U/engine/motor-imagem"; do [ -d "$M" ] || continue; echo "--- $M"; ls "$M" "$M/python" 2>/dev/null | head -20
             ls "$M"/python/lib/python*/site-packages 2>/dev/null | grep -i -E "^(torch|diffusers|transformers)" | head
-            for P in "$M/python/bin/python3" "$M/python/python3" "$M/python/bin/python"; do [ -x "$P" ] && { echo "python: $P"; "$P" -c "import sys, torch, diffusers; print(sys.prefix); print(torch.__file__, torch.__version__)" 2>&1 | tail -3; break; }; done
             cat "$M"/instalar-status-*.json 2>/dev/null | head -c 600; echo; done
           echo "=== reabrindo o EliteTube"
-          pkill -f "EliteTube.app/Contents/MacOS/EliteTube" || true; sleep 5; pkill -9 -f "EliteTube.app/Contents" || true; sleep 2
-          nohup "$HOME/EliteTube.app/Contents/MacOS/EliteTube" >> /tmp/app.out 2>&1 &
-          for i in $(seq 1 150); do if curl -sf -o /dev/null http://127.0.0.1:47615/gerar_status; then echo "servidor de volta em ~$((i*2)) s"; break; fi; sleep 2; done
+          /tmp/abrir-app.sh
           curl -s "http://127.0.0.1:47615/motor_img_status?motor=sd15"; echo
-          curl -s http://127.0.0.1:47615/motor_clone_status | head -c 400; echo
+          curl -s http://127.0.0.1:47615/motor_clone_status | head -c 600; echo
+          # a 4.0.4 conserta sozinha o motor de voz que a troca do .app quebrou: dar tempo
+          for i in $(seq 1 60); do
+            S=$(curl -s http://127.0.0.1:47615/motor_clone_status)
+            echo "$S" | grep -q '"rodando":true' || break
+            sleep 10
+          done
+          echo "depois da espera:"; curl -s http://127.0.0.1:47615/motor_clone_status | head -c 600; echo
+          /tmp/olhar-motor-voz.sh
 
-      - name: Gerar o video (1 minuto, 12 cenas)
-        env:
-          MOTOR: ${{ inputs.motor || 'sd15' }}
-          VOZ: ${{ inputs.voz || 'minha' }}
+      - name: Gerar o video
         run: |
           exec > >(tee -a /tmp/e2e/passos.txt) 2>&1
           node /tmp/e2e/piloto.js gerar
