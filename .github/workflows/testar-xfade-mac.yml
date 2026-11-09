@@ -1,0 +1,62 @@
+name: Testar transicoes (xfade) no Mac
+
+# A rodada 4 do teste do EliteTube no Mac (09/11/2026) terminou o video por "concat", sem
+# as transicoes entre as cenas: a montagem com transicoes falhou em menos de 1 s e o aviso
+# cortou o motivo. Aqui so o ffmpeg que o .dmg do Mac embarca (martin-riedl, ultima versao),
+# com cenas de teste feitas do MESMO jeito que o montador faz. Nenhum codigo do programa.
+
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/testar-xfade-mac.yml"]
+  workflow_dispatch:
+
+jobs:
+  xfade:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Baixar o ffmpeg do .dmg (o mesmo endereco do montador)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x && cd /tmp/x
+          for b in ffmpeg ffprobe; do
+            curl -fsSL --retry 3 -o "$b.zip" "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/$b.zip"
+            unzip -q -o "$b.zip" && rm "$b.zip" && chmod +x "$b"
+          done
+          ./ffmpeg -hide_banner -version | head -2
+          ./ffmpeg -hide_banner -filters 2>/dev/null | grep -E " (xfade|acrossfade|subtitles|zoompan|vignette) " || true
+
+      - name: Fazer 3 cenas como o montador faz
+        run: |
+          set -uo pipefail
+          cd /tmp/x
+          F=./ffmpeg
+          for i in 0 1 2; do
+            $F -hide_banner -v error -y -f lavfi -i "testsrc2=s=1024x576:d=1" -frames:v 1 "img$i.png"
+            $F -hide_banner -v error -y -f lavfi -i "sine=frequency=$((300+i*100)):duration=3.2" -ar 24000 -ac 1 "n$i.wav"
+            $F -hide_banner -v error -y -i "n$i.wav" -af apad=pad_dur=0.5 "c0$i.wav"
+            printf '[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 0\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV\nStyle: Def,Segoe UI Semibold,56,&H00FFFFFF,&H00000000,&H80000000,1,3,1,2,154,154,108\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:03.00,Def,,0,0,0,,Cena de teste %s\n' "$i" > "c0$i.ass"
+            D=3.7; FR=111
+            E="(pow(on/110,2)*(3-2*(on/110)))"
+            VF="scale=2880:1620:force_original_aspect_ratio=increase,crop=2880:1620,zoompan=z='1.0+0.13*$E':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=$FR:s=1920x1080:fps=30,eq=contrast=1.05:saturation=1.08:brightness=0.008,vignette=PI/5,subtitles=c0$i.ass,format=yuv420p"
+            $F -hide_banner -y -v error -loop 1 -i "img$i.png" -i "c0$i.wav" -t $D -vf "$VF" -c:v libx264 -crf 19 -preset medium -pix_fmt yuv420p -c:a aac -b:a 160k -ar 48000 -shortest "c0$i.mp4" || echo "CENA $i FALHOU"
+            ./ffprobe -v error -show_entries stream=codec_type,width,height,r_frame_rate,time_base,sample_rate,channel_layout -show_entries format=duration -of compact "c0$i.mp4"
+          done
+
+      - name: Juntar com transicoes (o grafo num arquivo, como o montador)
+        run: |
+          set -uo pipefail
+          cd /tmp/x
+          D0=$(./ffprobe -v error -show_entries format=duration -of csv=p=0 c00.mp4); D1=$(./ffprobe -v error -show_entries format=duration -of csv=p=0 c01.mp4); D2=$(./ffprobe -v error -show_entries format=duration -of csv=p=0 c02.mp4)
+          O1=$(python3 -c "print(f'{$D0-0.5:.3f}')"); O2=$(python3 -c "print(f'{$D0+$D1-1.0:.3f}')"); FO=$(python3 -c "print(f'{max(0.2,$D0+$D1+$D2-1.0-0.7):.3f}')")
+          printf '[0:v][1:v]xfade=transition=dissolve:duration=0.5:offset=%s[v1];[v1][2:v]xfade=transition=circleopen:duration=0.5:offset=%s[v2];[v2]fade=t=in:st=0:d=0.5,fade=t=out:st=%s:d=0.7[vout];[0:a][1:a]acrossfade=d=0.5:c1=tri:c2=nofade[a1];[a1][2:a]acrossfade=d=0.5:c1=tri:c2=nofade[a2];[a2]afade=t=out:st=%s:d=0.7[aout]' "$O1" "$O2" "$FO" "$FO" > xfade-grafo.txt
+          cat xfade-grafo.txt; echo
+          echo "=== 1) -filter_complex_script (o que o montador usa)"
+          ./ffmpeg -hide_banner -y -v error -i c00.mp4 -i c01.mp4 -i c02.mp4 -filter_complex_script xfade-grafo.txt -map '[vout]' -map '[aout]' -c:v libx264 -crf 19 -preset medium -pix_fmt yuv420p -c:a aac -b:a 160k -ar 48000 -movflags +faststart o1.mp4; echo "saiu com $?"
+          echo "=== 2) -/filter_complex (a forma nova)"
+          ./ffmpeg -hide_banner -y -v error -i c00.mp4 -i c01.mp4 -i c02.mp4 -/filter_complex xfade-grafo.txt -map '[vout]' -map '[aout]' -c:v libx264 -crf 19 -preset medium -pix_fmt yuv420p -c:a aac -b:a 160k -ar 48000 -movflags +faststart o2.mp4; echo "saiu com $?"
+          echo "=== 3) o grafo na linha de comando"
+          ./ffmpeg -hide_banner -y -v error -i c00.mp4 -i c01.mp4 -i c02.mp4 -filter_complex "$(cat xfade-grafo.txt)" -map '[vout]' -map '[aout]' -c:v libx264 -crf 19 -preset medium -pix_fmt yuv420p -c:a aac -b:a 160k -ar 48000 -movflags +faststart o3.mp4; echo "saiu com $?"
+          ls -la o*.mp4 2>/dev/null || true
+          for f in o1.mp4 o2.mp4 o3.mp4; do [ -f "$f" ] && echo "$f: $(./ffprobe -v error -show_entries format=duration -of csv=p=0 "$f") s"; done
