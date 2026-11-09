@@ -29,31 +29,16 @@ on:
         description: "Atualizar o programa por cima depois de instalar os motores (sim/nao)"
         required: true
         default: "sim"
-      motor:
-        description: "Motor de imagem: sd15 (o do Membro) ou leve (rapido)"
-        required: true
-        default: "leve"
       voz:
         description: "Voz: minha (gravada, clonagem) ou local"
         required: true
         default: "minha"
-      paragrafos:
-        description: "Quantos paragrafos do roteiro de teste (1 a 12)"
-        required: true
-        default: "4"
-      conserto_python:
-        description: "Aplicar o conserto do python do motor de imagem (sim/nao)"
-        required: true
-        default: "sim"
 
 env:
   DMG1: ${{ inputs.dmg || 'https://loja.eliteaisolutions.app.br/storage/updates/elitetube/EliteTube-latest-mac.dmg' }}
-  DMG2: ${{ inputs.dmg_novo || inputs.dmg || 'https://loja.eliteaisolutions.app.br/storage/updates/elitetube/EliteTube-latest-mac.dmg' }}
+  DMG2: ${{ inputs.dmg_novo || 'https://github.com/teotonioleite001-lgtm/whisper-mac-build/releases/download/ponte/EliteTube-4.0.4-arm64.dmg' }}
   ATUALIZAR: ${{ inputs.atualizar || 'sim' }}
-  MOTOR: ${{ inputs.motor || 'leve' }}
   VOZ: ${{ inputs.voz || 'minha' }}
-  PARAGRAFOS: ${{ inputs.paragrafos || '4' }}
-  CONSERTO: ${{ inputs.conserto_python || 'sim' }}
 
 jobs:
   e2e:
@@ -61,6 +46,25 @@ jobs:
     permissions:
       contents: write
     timeout-minutes: 300
+    # OS DOIS CASOS REAIS DE MEMBRO DE MAC (09/11/2026), os dois instalando na 4.0.3 e
+    # atualizando por cima para a nova:
+    #  voz    = o caso Edgard: voz gravada, motor de clonagem instalado na versao velha.
+    #  imagem = quem instalou o motor SD na 4.0.3 (o torch foi parar dentro do .app).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cenario: voz
+            motor: leve
+            paragrafos: "4"
+          - cenario: imagem
+            motor: sd15
+            paragrafos: "2"
+    env:
+      CENARIO: ${{ matrix.cenario }}
+      MOTOR: ${{ matrix.motor }}
+      PARAGRAFOS: ${{ matrix.paragrafos }}
+      CONSERTO: "nao"
 
     steps:
       - name: Maquina
@@ -71,7 +75,7 @@ jobs:
           sysctl hw.ncpu hw.memsize 2>/dev/null || true
           sw_vers
           df -h / | tail -1
-          echo "dmg1=$DMG1"; echo "dmg2=$DMG2"; echo "atualizar=$ATUALIZAR motor=$MOTOR voz=$VOZ paragrafos=$PARAGRAFOS conserto=$CONSERTO"
+          echo "dmg1=$DMG1"; echo "dmg2=$DMG2"; echo "cenario=$CENARIO atualizar=$ATUALIZAR motor=$MOTOR voz=$VOZ paragrafos=$PARAGRAFOS conserto=$CONSERTO"
 
       - uses: actions/setup-node@v4
         with:
@@ -193,15 +197,39 @@ jobs:
               const lc = 'clonagem: ' + (c.rodando ? 'baixando' : (c.presente ? 'PRONTO' : 'parado')) + (c.erro ? ' ERRO ' + c.erro : '');
               const li = 'imagem: ' + (i.rodando ? 'baixando ' + JSON.stringify(i).slice(0, 140) : (s.instalado ? 'PRONTO' : 'parado')) + (i.erro ? ' ERRO ' + i.erro : '');
               if (lc + li !== ult) { console.log(min(), lc, '|', li); ult = lc + li; }
-              if ((VOZ !== 'minha' || (c.presente && !c.rodando)) && (MOTOR !== 'sd15' || (s.instalado && !i.rodando))) { console.log(min(), 'MOTORES PRONTOS'); return 0; }
+              // na 4.0.3 o motor SD instala e NUNCA aparece "instalado" (o torch foi para dentro do
+              // .app); o fim da instalacao e o arquivo de status dizendo pronto
+              if ((VOZ !== 'minha' || (c.presente && !c.rodando)) && (MOTOR !== 'sd15' || (!i.rodando && (s.instalado || i.pronto === true)))) { console.log(min(), 'MOTORES PRONTOS', '| imagem instalado=' + s.instalado); return 0; }
               if ((c.erro && !c.rodando) || (i.erro && !i.rodando)) { console.log(min(), 'A INSTALACAO FALHOU'); return 2; }
               if (Date.now() - t0 > 100 * 60000) { console.log(min(), 'a instalacao passou de 100 min'); return 3; }
             }
           }
+          // O MOTOR QUE A ATUALIZACAO QUEBROU (4.0.4): o primeiro Gerar dispara o conserto. No
+          // motor de imagem ele avisa "esta sendo reconectado" e pede para gerar de novo; aqui o
+          // piloto faz o que o Membro faria: espera o cartao ficar pronto e manda gerar outra vez.
           async function gerar() {
+            let r = await umaGeracao();
+            if (r && r.reconectando) {
+              console.log(min(), 'o programa esta reconectando o motor; esperando como o Membro esperaria');
+              let ult = '';
+              for (let k = 0; k < 240; k++) {
+                await espera(15000);
+                const s = await req('GET', '/motor_img_status?motor=' + MOTOR);
+                const i = await req('GET', '/baixar_motor_img_status?motor=' + MOTOR);
+                const c = await req('GET', '/motor_clone_status');
+                const l = 'imagem instalado=' + s.instalado + ' rodando=' + i.rodando + ' ' + (i.etapa || '') + ' | voz presente=' + c.presente + ' rodando=' + c.rodando;
+                if (l !== ult) { console.log(min(), l); ult = l; }
+                if (s.instalado && !i.rodando) break;
+                if (i.erro && !i.rodando) { console.log(min(), 'o conserto do motor de imagem falhou:', i.erro); return 7; }
+              }
+              r = await umaGeracao();
+            }
+            return r && typeof r.codigo === 'number' ? r.codigo : 9;
+          }
+          async function umaGeracao() {
             const v = await req('GET', '/vozes'); const vozes = (v && v.vozes) || [];
             const voz = VOZ === 'minha' ? vozes.find(x => x.minha) : (vozes.find(x => x.padrao && !x.minha && !x.bloqueada) || vozes.find(x => !x.minha && !x.bloqueada));
-            if (!voz) { console.log('nao achei a voz', VOZ); return 4; }
+            if (!voz) { console.log('nao achei a voz', VOZ); return { codigo: 4 }; }
             console.log(min(), 'voz:', voz.id, '|', voz.nome, '| motor de imagem:', MOTOR, '| paragrafos:', PARAGRAFOS);
             const roteiro = [
               'Você já parou para pensar quanto tempo perde todos os dias com tarefas repetitivas?',
@@ -220,7 +248,7 @@ jobs:
             const g = await req('POST', '/gerar', { roteiro, audio: 'elitetube', vertical: false, quadrado: false, estilo: '',
               legenda: 'elite', motor_img: MOTOR, mistura: null, reusar_imagens: false, voz: voz.id, modo: null, avatar: null, transicao: '' });
             console.log(min(), '/gerar:', JSON.stringify(g).slice(0, 300));
-            if (g && g.ok === false) return 5;
+            if (g && g.ok === false) return { codigo: 5 };
             let ultima = '', fim = null;
             for (let k = 0; k < 2400; k++) {           // ate 200 min
               await espera(5000);
@@ -230,9 +258,10 @@ jobs:
               if (!s.gerando && k > 2) { fim = s; break; }
             }
             console.log(min(), '=== FIM ===');
-            if (!fim) { console.log('nao terminou em 200 min'); return 6; }
+            if (!fim) { console.log('nao terminou em 200 min'); return { codigo: 6 }; }
             console.log('erro :', fim.erro || '(nenhum)'); console.log('aviso:', fim.aviso || '(nenhum)'); console.log('video:', fim.ultimo || '(nenhum)');
-            return (fim.ultimo && !fim.erro) ? 0 : 1;
+            if (fim.erro && /reconectad/i.test(fim.erro)) return { reconectando: true };
+            return { codigo: (fim.ultimo && !fim.erro) ? 0 : 1 };
           }
           (FASE === 'motores' ? motores() : gerar()).then(c => process.exit(c)).catch(e => { console.log('piloto quebrou:', e); process.exit(9); });
           JS
@@ -318,5 +347,6 @@ jobs:
           rm -f k.txt
           T=diagnostico-elitetube-mac
           gh release view "$T" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$T" -R "$GITHUB_REPOSITORY" --title "Diagnostico (cifrado)" --notes "Saida cifrada do teste do EliteTube no Mac. Temporario."
-          gh release upload "$T" diagnostico.bin chave.bin -R "$GITHUB_REPOSITORY" --clobber
+          mv diagnostico.bin "diagnostico-$CENARIO.bin"; mv chave.bin "chave-$CENARIO.bin"
+          gh release upload "$T" "diagnostico-$CENARIO.bin" "chave-$CENARIO.bin" -R "$GITHUB_REPOSITORY" --clobber
           echo "publicado: run $GITHUB_RUN_ID"
