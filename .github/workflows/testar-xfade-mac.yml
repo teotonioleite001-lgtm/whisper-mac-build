@@ -46,7 +46,8 @@ jobs:
 
       - name: Juntar com transicoes (o grafo num arquivo, como o montador)
         run: |
-          set -uo pipefail
+          set +e
+          # rodada 2: as tres formas rodam ate o fim (a 1a parou o passo na rodada 1)
           cd /tmp/x
           D0=$(./ffprobe -v error -show_entries format=duration -of csv=p=0 c00.mp4); D1=$(./ffprobe -v error -show_entries format=duration -of csv=p=0 c01.mp4); D2=$(./ffprobe -v error -show_entries format=duration -of csv=p=0 c02.mp4)
           O1=$(python3 -c "print(f'{$D0-0.5:.3f}')"); O2=$(python3 -c "print(f'{$D0+$D1-1.0:.3f}')"); FO=$(python3 -c "print(f'{max(0.2,$D0+$D1+$D2-1.0-0.7):.3f}')")
