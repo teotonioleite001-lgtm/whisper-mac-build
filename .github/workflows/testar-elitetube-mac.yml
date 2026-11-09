@@ -26,6 +26,10 @@ on:
         description: "Voz: minha (gravada, clonagem) ou local"
         required: true
         default: "minha"
+      conserto_python:
+        description: "Aplicar o conserto do python do motor de imagem (sim/nao)"
+        required: true
+        default: "sim"
 
 jobs:
   e2e:
@@ -66,6 +70,15 @@ jobs:
           grep -n "const EXIGIR_LICENCA = true;" "$M"
           sed -i "" "s/const EXIGIR_LICENCA = true;/const EXIGIR_LICENCA = false;/" "$M"
           grep -n "const EXIGIR_LICENCA" "$M"
+          # CONSERTO EM TESTE (09/11): o instalador do motor de imagem copia o python da voz
+          # com fs.cpSync, e sem verbatimSymlinks os links viram caminhos ABSOLUTOS para dentro
+          # do .app: o torch ia parar dentro do EliteTube.app e o motor nunca era achado.
+          I="$HOME/EliteTube.app/Contents/Resources/app/engine-node/instalar-motor-imagem.js"
+          if [ "${{ inputs.conserto_python || 'sim' }}" = "sim" ]; then
+            sed -i "" "s/fs.cpSync(_emb, pyDir, { recursive: true, force: true });/fs.cpSync(_emb, pyDir, { recursive: true, force: true, verbatimSymlinks: true });/" "$I"
+          fi
+          grep -n "fs.cpSync(_emb" "$I"
+          ls -la "$HOME/EliteTube.app/Contents/Resources/bin/pyvoz/bin" | head -8
           codesign --force --deep --sign - "$HOME/EliteTube.app" && echo "reassinado (ad-hoc) so neste Mac de teste"
 
       - name: Gravar a voz de teste (igual ao "Gravar minha voz")
