@@ -1,0 +1,191 @@
+name: Testar o EliteTube no Mac (video inteiro)
+
+# Gera um video DE VERDADE num Mac Apple Silicon, com o MESMO .dmg que o Membro baixa:
+# instala o motor de imagem e o de clonagem pelo proprio programa, grava uma voz de teste
+# (como o "Gravar minha voz") e pede um video de ~1 minuto (12 cenas), do jeito que a tela
+# pede. Nasceu do caso Edgard (MacBook M4, 08/11/2026): na 4.0.3 a narracao passou e veio
+# "nao consegui montar o video". Ate esta data NINGUEM tinha visto o EliteTube terminar um
+# video inteiro num Mac.
+
+on:
+  # dispara sozinho quando este arquivo chega ao repositorio (sem precisar do botao)
+  push:
+    branches: [main]
+    paths: [".github/workflows/testar-elitetube-mac.yml"]
+  workflow_dispatch:
+    inputs:
+      dmg:
+        description: "Endereco do .dmg"
+        required: true
+        default: "https://loja.eliteaisolutions.app.br/storage/updates/elitetube/EliteTube-latest-mac.dmg"
+      motor:
+        description: "Motor de imagem: sd15 (o do Membro) ou leve (rapido)"
+        required: true
+        default: "sd15"
+      voz:
+        description: "Voz: minha (gravada, clonagem) ou local"
+        required: true
+        default: "minha"
+
+jobs:
+  e2e:
+    runs-on: macos-15
+    timeout-minutes: 300
+
+    steps:
+      - name: Maquina
+        run: |
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl hw.ncpu hw.memsize 2>/dev/null || true
+          sw_vers
+          df -h / | tail -1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Baixar o EliteTube (o mesmo .dmg da area de membros)
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/et.dmg "${{ inputs.dmg || 'https://loja.eliteaisolutions.app.br/storage/updates/elitetube/EliteTube-latest-mac.dmg' }}"
+          ls -la /tmp/et.dmg
+          shasum -a 256 /tmp/et.dmg
+          hdiutil attach -nobrowse -readonly -mountpoint /Volumes/ET /tmp/et.dmg
+          ls /Volumes/ET
+          cp -R /Volumes/ET/*.app "$HOME/EliteTube.app"
+          hdiutil detach /Volumes/ET
+          rm -f /tmp/et.dmg
+          echo "versao: $(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$HOME/EliteTube.app/Contents/Info.plist")"
+          ls "$HOME/EliteTube.app/Contents/Resources"
+
+      - name: Gravar a voz de teste (igual ao "Gravar minha voz")
+        run: |
+          set -euo pipefail
+          D="$HOME/Library/Application Support/EliteTube/engine/minhas-vozes"
+          mkdir -p "$D"
+          V=Luciana
+          say -v '?' | grep -q '^Luciana' || V=$(say -v '?' | grep -m1 'pt_BR' | awk '{print $1}')
+          echo "voz do sistema: $V"
+          say -v "$V" -o /tmp/voz.aiff "Olá, este é um teste de gravação da minha voz para o programa. Eu estou falando de forma natural e com calma, para que a clonagem capture o meu timbre, o meu ritmo e a minha entonação. Vamos ver como fica a narração com a minha própria voz."
+          afconvert -f WAVE -d LEI16@24000 -c 1 /tmp/voz.aiff "$D/teste.wav"
+          printf '{"nome":"Voz Teste","segundos":14,"criada":"2026-11-09T00:00:00.000Z"}' > "$D/teste.json"
+          ls -la "$D"
+
+      - name: Abrir o EliteTube
+        run: |
+          set -euo pipefail
+          nohup "$HOME/EliteTube.app/Contents/MacOS/EliteTube" > /tmp/app.out 2>&1 &
+          echo $! > /tmp/app.pid
+          for i in $(seq 1 150); do
+            if curl -sf -o /dev/null http://127.0.0.1:47615/gerar_status; then echo "servidor no ar em ~$((i*2)) s"; break; fi
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:47615/gerar_status > /tmp/st.json; head -c 300 /tmp/st.json; echo
+          curl -sf http://127.0.0.1:47615/vozes > /tmp/vozes.json
+          node -e 'const d=require("/tmp/vozes.json"); const v=d.vozes||d; console.log(v.length,"vozes"); for (const x of v) console.log("  "+x.id+" | "+(x.nome||"")+(x.minha?" | MINHA":"")+(x.bloqueada?" | bloqueada":""))'
+
+      - name: Escrever o roteiro de teste e o piloto
+        run: |
+          mkdir -p /tmp/e2e
+          cat > /tmp/e2e/piloto.js <<'JS'
+          // Fala com o EliteTube pelo MESMO endereco que a tela usa.
+          const http = require('http');
+          const MOTOR = process.env.MOTOR || 'sd15', VOZ = process.env.VOZ || 'minha', FASE = process.argv[2];
+          const t0 = Date.now(), min = () => ((Date.now() - t0) / 60000).toFixed(1).padStart(5) + ' min';
+          function req(m, p, b) { return new Promise(ok => {
+            const d = b ? Buffer.from(JSON.stringify(b)) : null;
+            const r = http.request({ host: '127.0.0.1', port: 47615, path: p, method: m, timeout: 30000,
+              headers: d ? { 'Content-Type': 'application/json', 'Content-Length': d.length } : {} }, res => {
+              let s = ''; res.on('data', c => s += c);
+              res.on('end', () => { try { ok(JSON.parse(s)); } catch (e) { ok({ _cru: s.slice(0, 300) }); } }); });
+            r.on('error', e => ok({ _erro: e.message })); r.on('timeout', () => { r.destroy(); ok({ _erro: 'timeout' }); });
+            if (d) r.write(d); r.end(); }); }
+          const espera = ms => new Promise(s => setTimeout(s, ms));
+          async function motores() {
+            if (VOZ === 'minha') console.log(min(), 'pedi o motor de clonagem:', JSON.stringify(await req('POST', '/baixar_motor_clone', {})));
+            if (MOTOR === 'sd15') console.log(min(), 'pedi o motor de imagem:', JSON.stringify(await req('POST', '/baixar_motor_img', { motor: 'sd15' })));
+            let ult = '';
+            for (;;) {
+              await espera(15000);
+              const c = VOZ === 'minha' ? await req('GET', '/motor_clone_status') : { presente: true };
+              const i = MOTOR === 'sd15' ? await req('GET', '/baixar_motor_img_status?motor=sd15') : {};
+              const s = MOTOR === 'sd15' ? await req('GET', '/motor_img_status?motor=sd15') : { instalado: true };
+              const lc = 'clonagem: ' + (c.rodando ? 'baixando' : (c.presente ? 'PRONTO' : 'parado')) + (c.erro ? ' ERRO ' + c.erro : '');
+              const li = 'imagem: ' + (i.rodando ? 'baixando ' + JSON.stringify(i).slice(0, 140) : (s.instalado ? 'PRONTO' : 'parado')) + (i.erro ? ' ERRO ' + i.erro : '');
+              if (lc + li !== ult) { console.log(min(), lc, '|', li); ult = lc + li; }
+              if ((VOZ !== 'minha' || (c.presente && !c.rodando)) && (MOTOR !== 'sd15' || (s.instalado && !i.rodando))) { console.log(min(), 'MOTORES PRONTOS'); return 0; }
+              if ((c.erro && !c.rodando) || (i.erro && !i.rodando)) { console.log(min(), 'A INSTALACAO FALHOU'); return 2; }
+              if (Date.now() - t0 > 100 * 60000) { console.log(min(), 'a instalacao passou de 100 min'); return 3; }
+            }
+          }
+          async function gerar() {
+            const v = await req('GET', '/vozes'); const vozes = (v && v.vozes) || [];
+            const voz = VOZ === 'minha' ? vozes.find(x => x.minha) : (vozes.find(x => x.padrao && !x.minha && !x.bloqueada) || vozes.find(x => !x.minha && !x.bloqueada));
+            if (!voz) { console.log('nao achei a voz', VOZ); return 4; }
+            console.log(min(), 'voz:', voz.id, '|', voz.nome, '| motor de imagem:', MOTOR);
+            const roteiro = [
+              'Você já parou para pensar quanto tempo perde todos os dias com tarefas repetitivas?',
+              'Hoje eu vou mostrar três hábitos simples que mudam completamente a sua produtividade.',
+              'O primeiro hábito é planejar o dia na noite anterior, com calma e sem pressa.',
+              'Quando você acorda sabendo o que fazer, a manhã rende muito mais.',
+              'O segundo hábito é fazer primeiro a tarefa mais difícil do dia.',
+              'Com a energia alta, o que parecia impossível fica bem mais leve.',
+              'O terceiro hábito é desligar as notificações enquanto você trabalha.',
+              'Cada interrupção custa minutos preciosos para recuperar a concentração.',
+              'Junte esses três hábitos e observe a diferença em uma semana.',
+              'Você vai terminar o dia com mais tempo e menos cansaço.',
+              'Comece hoje mesmo, com um hábito de cada vez.',
+              'E me conte nos comentários qual deles você vai testar primeiro.',
+            ].join('\n\n');
+            const g = await req('POST', '/gerar', { roteiro, audio: 'elitetube', vertical: false, quadrado: false, estilo: '',
+              legenda: 'elite', motor_img: MOTOR, mistura: null, reusar_imagens: false, voz: voz.id, modo: null, avatar: null, transicao: '' });
+            console.log(min(), '/gerar:', JSON.stringify(g).slice(0, 300));
+            if (g && g.ok === false) return 5;
+            let ultima = '', fim = null;
+            for (let k = 0; k < 2400; k++) {           // ate 200 min
+              await espera(5000);
+              const s = await req('GET', '/gerar_status'); if (s._erro) continue;
+              const e = s.etapa || '';
+              if (e && e !== ultima) { console.log(min(), 'TELA:', e); ultima = e; }
+              if (!s.gerando && k > 2) { fim = s; break; }
+            }
+            console.log(min(), '=== FIM ===');
+            if (!fim) { console.log('nao terminou em 200 min'); return 6; }
+            console.log('erro :', fim.erro || '(nenhum)'); console.log('aviso:', fim.aviso || '(nenhum)'); console.log('video:', fim.ultimo || '(nenhum)');
+            return (fim.ultimo && !fim.erro) ? 0 : 1;
+          }
+          (FASE === 'motores' ? motores() : gerar()).then(c => process.exit(c)).catch(e => { console.log('piloto quebrou:', e); process.exit(9); });
+          JS
+          echo ok
+
+      - name: Instalar os motores pelo proprio programa
+        env:
+          MOTOR: ${{ inputs.motor || 'sd15' }}
+          VOZ: ${{ inputs.voz || 'minha' }}
+        run: node /tmp/e2e/piloto.js motores
+
+      - name: Gerar o video (1 minuto, 12 cenas)
+        env:
+          MOTOR: ${{ inputs.motor || 'sd15' }}
+          VOZ: ${{ inputs.voz || 'minha' }}
+        run: node /tmp/e2e/piloto.js gerar
+
+      - name: Registro do programa (elitetube.log)
+        if: always()
+        run: |
+          U="$HOME/Library/Application Support/EliteTube"
+          ls -la "$U" "$U/engine/saida" 2>/dev/null || true
+          cp "$U"/elitetube.log* /tmp/e2e/ 2>/dev/null || true
+          cp /tmp/app.out /tmp/e2e/ 2>/dev/null || true
+          cp "$U/engine/saida/elitetube-demo.mp4" /tmp/e2e/ 2>/dev/null || true
+          echo "================ elitetube.log (ultimas 300 linhas) ================"
+          tail -n 300 "$U/elitetube.log" 2>/dev/null || echo "(sem elitetube.log)"
+          echo "================ saida do aplicativo (ultimas 60) ================"
+          tail -n 60 /tmp/app.out 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: elitetube-mac-e2e
+          path: /tmp/e2e
+          if-no-files-found: warn
