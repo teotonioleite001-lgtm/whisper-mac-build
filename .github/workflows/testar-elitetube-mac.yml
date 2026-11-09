@@ -182,6 +182,23 @@ jobs:
           exec > >(tee -a /tmp/e2e/passos.txt) 2>&1
           node /tmp/e2e/piloto.js motores
 
+      - name: Conferir o motor de imagem e reabrir o programa (como o Membro faz)
+        run: |
+          exec > >(tee -a /tmp/e2e/passos.txt) 2>&1
+          U="$HOME/Library/Application Support/EliteTube"
+          echo "=== onde ficaram os motores"; ls "$U"
+          for M in "$U/motor-imagem" "$U/engine/motor-imagem"; do [ -d "$M" ] || continue; echo "--- $M"; ls "$M" "$M/python" "$M/python/bin" 2>/dev/null | head -40
+            ls -d "$M"/python/lib/python*/site-packages 2>/dev/null
+            ls "$M"/python/lib/python*/site-packages 2>/dev/null | grep -i -E "^(torch|diffusers|transformers)" | head
+            for P in "$M/python/bin/python3" "$M/python/python3" "$M/python/bin/python"; do [ -x "$P" ] && { echo "python: $P"; "$P" -c "import sys, torch, diffusers; print(sys.prefix); print(torch.__file__, torch.__version__)" 2>&1 | tail -3; break; }; done
+            cat "$M"/instalar-status-*.json 2>/dev/null | head -c 600; echo; done
+          echo "=== reabrindo o EliteTube"
+          pkill -f "EliteTube.app/Contents/MacOS/EliteTube" || true; sleep 5; pkill -9 -f "EliteTube.app/Contents" || true; sleep 2
+          nohup "$HOME/EliteTube.app/Contents/MacOS/EliteTube" >> /tmp/app.out 2>&1 &
+          for i in $(seq 1 150); do if curl -sf -o /dev/null http://127.0.0.1:47615/gerar_status; then echo "servidor de volta em ~$((i*2)) s"; break; fi; sleep 2; done
+          curl -s "http://127.0.0.1:47615/motor_img_status?motor=sd15"; echo
+          curl -s http://127.0.0.1:47615/motor_clone_status | head -c 400; echo
+
       - name: Gerar o video (1 minuto, 12 cenas)
         env:
           MOTOR: ${{ inputs.motor || 'sd15' }}
