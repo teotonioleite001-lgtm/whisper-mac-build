@@ -142,8 +142,11 @@ jobs:
           set -euo pipefail
           PY=./resources/bin-mac/pyvoz/python
           "$PY" -m pip install --no-cache-dir --upgrade pip
+          # edge-tts 7.3.1, a MESMA do pyvoz do Windows (desde 06/11/2026). A 7.2.8 leva 403
+          # do servico da Microsoft em toda sintese (medido em 09/11/2026): no Mac as vozes
+          # de nuvem caiam todas na voz local.
           "$PY" -m pip install --no-cache-dir \
-            "soundfile==0.14.0" "numpy==2.4.6" "kokoro-onnx==0.6.1" "edge-tts==7.2.8"
+            "soundfile==0.14.0" "numpy==2.4.6" "kokoro-onnx==0.6.1" "edge-tts==7.3.1"
           "$PY" -m pip list
           # enxugar o que nao roda em producao
           find resources/bin-mac/pyvoz -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
@@ -181,6 +184,15 @@ jobs:
             echo "ERRO: feminina e masculina geraram audio identico"; exit 1
           fi
           echo "ok, saidas diferentes"
+
+          echo "--- voz de nuvem (edge-tts, Francisca) ---"
+          # Importar nao prova nada: em 09/11/2026 a 7.2.8 importava certinho e o servico da
+          # Microsoft recusava TODA sintese com 403. So gerando audio de verdade se ve isso.
+          printf 'Teste da voz de nuvem da Elite A I Solutions.' | "$PY" engine-node/edge_synth.py \
+            pt-BR-FranciscaNeural /tmp/edge.mp3 || { echo "ERRO: a voz de nuvem (edge-tts) falhou"; exit 1; }
+          T=$(stat -f%z /tmp/edge.mp3)
+          echo "voz de nuvem gerou $T bytes"
+          test "$T" -gt 5000 || { echo "ERRO: a voz de nuvem saiu vazia"; exit 1; }
 
           echo "--- transcricao (whisper) ---"
           ./resources/bin-mac/whisper/whisper-cli -m resources/bin-mac/models/ggml-base.bin \
