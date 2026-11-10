@@ -1,0 +1,145 @@
+name: Testar a voz de nuvem do EliteTube no Mac
+
+# Nasceu em 10/11/2026: o edge-tts 7.2.8 levava 403 do servico da Microsoft e, no Mac, as
+# oito vozes de nuvem caiam na voz local. Este teste instala o .dmg num Mac de verdade, pede
+# um video com a Francisca (nuvem) pelo MESMO endereco que a tela usa e confere se a narracao
+# saiu da nuvem. A 4.0.4 entra como CONTROLE: nela a troca TEM de aparecer; se nao aparecer,
+# o teste nao esta medindo nada e falha tambem.
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/testar-voz-nuvem-mac.yml"]
+  workflow_dispatch:
+
+jobs:
+  nuvem:
+    runs-on: macos-15
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - versao: "4.0.4"
+            dmg: "https://loja.eliteaisolutions.app.br/storage/updates/elitetube/EliteTube-latest-mac.dmg"
+            espera: troca
+          - versao: "4.0.5"
+            dmg: "https://github.com/teotonioleite001-lgtm/whisper-mac-build/releases/download/ponte/EliteTube-4.0.5-arm64.dmg"
+            espera: nuvem
+    env:
+      VERSAO: ${{ matrix.versao }}
+      DMG: ${{ matrix.dmg }}
+      ESPERA: ${{ matrix.espera }}
+
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Instalar o EliteTube do .dmg
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/et.dmg "$DMG"
+          shasum -a 256 /tmp/et.dmg
+          hdiutil attach -nobrowse -readonly -mountpoint /Volumes/ET /tmp/et.dmg >/dev/null
+          rm -rf "$HOME/EliteTube.app"
+          cp -R /Volumes/ET/*.app "$HOME/EliteTube.app"
+          hdiutil detach /Volumes/ET >/dev/null
+          rm -f /tmp/et.dmg
+          V=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$HOME/EliteTube.app/Contents/Info.plist")
+          echo "versao instalada: $V (esperada $VERSAO)"
+          test "$V" = "$VERSAO"
+          M="$HOME/EliteTube.app/Contents/Resources/app/main.js"
+          sed -i "" "s/const EXIGIR_LICENCA = true;/const EXIGIR_LICENCA = false;/" "$M"
+          grep -n "const EXIGIR_LICENCA" "$M"
+          codesign --force --deep --sign - "$HOME/EliteTube.app" >/dev/null 2>&1 && echo "reassinado (ad-hoc) so neste Mac de teste"
+          P=$(find "$HOME/EliteTube.app/Contents/Resources" -path "*edge_tts*" -name version.py | head -1)
+          echo "edge-tts do pacote: $(grep __version__ "$P" | head -1)"
+
+      - name: Abrir o EliteTube
+        run: |
+          nohup "$HOME/EliteTube.app/Contents/MacOS/EliteTube" >> /tmp/app.out 2>&1 &
+          for i in $(seq 1 150); do
+            if curl -sf -o /dev/null http://127.0.0.1:47615/gerar_status; then echo "servidor no ar em ~$((i*2)) s"; exit 0; fi
+            sleep 2
+          done
+          echo "O PROGRAMA NAO SUBIU"; tail -n 60 /tmp/app.out; exit 1
+
+      - name: Gerar um video com a Francisca (nuvem)
+        run: |
+          cat > /tmp/piloto.js <<'JS'
+          // Fala com o EliteTube pelo MESMO endereco que a tela usa.
+          const http = require('http'), fs = require('fs');
+          const ESPERA = process.env.ESPERA;
+          const t0 = Date.now(), min = () => ((Date.now() - t0) / 60000).toFixed(1).padStart(5) + ' min';
+          function req(m, p, b) { return new Promise(ok => {
+            const d = b ? Buffer.from(JSON.stringify(b)) : null;
+            const r = http.request({ host: '127.0.0.1', port: 47615, path: p, method: m, timeout: 30000,
+              headers: d ? { 'Content-Type': 'application/json', 'Content-Length': d.length } : {} }, res => {
+              let s = ''; res.on('data', c => s += c);
+              res.on('end', () => { try { ok(JSON.parse(s)); } catch (e) { ok({ _cru: s.slice(0, 300) }); } }); });
+            r.on('error', e => ok({ _erro: e.message })); r.on('timeout', () => { r.destroy(); ok({ _erro: 'timeout' }); });
+            if (d) r.write(d); r.end(); }); }
+          const espera = ms => new Promise(s => setTimeout(s, ms));
+          (async () => {
+            const v = await req('GET', '/vozes'); const vozes = (v && v.vozes) || [];
+            const voz = vozes.find(x => x.motor === 'edge' && x.voice === 'pt-BR-FranciscaNeural');
+            if (!voz) { console.log('NAO ACHEI A FRANCISCA na lista:', vozes.map(x => x.id).join(', ')); process.exit(4); }
+            console.log(min(), 'voz:', voz.id, '|', voz.nome, '|', voz.voice);
+            const roteiro = [
+              'A Catedral da Sé recebe visitantes todos os dias, com atenção e dedicação.',
+              'Quem entra pela porta principal sente a luz dos vitrais e ouve o silêncio da nave.',
+              'Ninguém passa por aqui sem levar uma lembrança no coração.',
+            ].join('\n\n');
+            fs.writeFileSync('/tmp/roteiro.txt', roteiro);
+            const g = await req('POST', '/gerar', { roteiro, audio: 'elitetube', vertical: false, quadrado: false, estilo: '',
+              legenda: 'elite', motor_img: 'leve', mistura: null, reusar_imagens: false, voz: voz.id, modo: null, avatar: null, transicao: '' });
+            console.log(min(), '/gerar:', JSON.stringify(g).slice(0, 300));
+            if (g && g.ok === false) process.exit(5);
+            let ultima = '', fim = null;
+            for (let k = 0; k < 720; k++) {          // ate 60 min
+              await espera(5000);
+              const s = await req('GET', '/gerar_status'); if (s._erro) continue;
+              const e = s.etapa || ''; if (e && e !== ultima) { console.log(min(), 'TELA:', e); ultima = e; }
+              if (!s.gerando && k > 2) { fim = s; break; }
+            }
+            if (!fim) { console.log('nao terminou em 60 min'); process.exit(6); }
+            fs.writeFileSync('/tmp/fim.json', JSON.stringify(fim));
+            console.log('erro :', fim.erro || '(nenhum)'); console.log('aviso:', fim.aviso || '(nenhum)'); console.log('video:', fim.ultimo || '(nenhum)');
+            if (!fim.ultimo || fim.erro) process.exit(1);
+            const trocou = /n[aã]o respondeu/i.test(fim.aviso || '');
+            console.log('a voz escolhida foi trocada pela local?', trocou ? 'SIM' : 'nao');
+            if (ESPERA === 'nuvem' && trocou) { console.log('FALHOU: a voz de nuvem caiu na local'); process.exit(7); }
+            if (ESPERA === 'troca' && !trocou) { console.log('FALHOU: o controle nao mostrou a troca; o teste nao esta medindo'); process.exit(8); }
+            console.log('CONFERE com o esperado (' + ESPERA + ')');
+          })().catch(e => { console.log('piloto quebrou:', e); process.exit(9); });
+          JS
+          node /tmp/piloto.js
+
+      - name: Ouvir a narracao do video (o whisper do proprio pacote)
+        if: always()
+        run: |
+          set +e     # passo de diagnostico: nada aqui decide se o teste passou
+          U="$HOME/Library/Application Support/EliteTube"
+          R="$HOME/EliteTube.app/Contents/Resources"
+          V=$(find "$U" "$HOME/Documents" -name "*.mp4" -newer /tmp/roteiro.txt 2>/dev/null | head -1)
+          echo "video: ${V:-(nenhum)}"
+          FF=$(find "$R" -type f -name ffmpeg | head -1); WC=$(find "$R" -type f -name whisper-cli | head -1); MD=$(find "$R" -type f -name "ggml-base.bin" | head -1)
+          echo "ffmpeg=$FF"; echo "whisper=$WC"; echo "modelo=$MD"
+          OUVIU="(sem video)"
+          if [ -n "$V" ]; then
+            "$FF" -v error -y -i "$V" -vn -ar 16000 -ac 1 -c:a pcm_s16le /tmp/narr.wav
+            "$WC" -m "$MD" -f /tmp/narr.wav -l pt -nt -np > /tmp/ouvido.txt 2>/dev/null || true
+            OUVIU=$(tr '\n' ' ' < /tmp/ouvido.txt)
+          fi
+          echo "--- o que o whisper ouviu: $OUVIU"
+          L=""; for c in "$U/elitetube.log" "$HOME/Documents/Elite AI Solutions/elitetube.log"; do [ -f "$c" ] && L="$c"; done
+          echo "--- registro ($L), linhas da montagem e da voz:"
+          [ -n "$L" ] && grep -E "montagem|VOZ-TROCADA|edge_synth|narracao" "$L" | tail -20
+          AVISO=$(node -p "try{require('/tmp/fim.json').aviso||'(nenhum)'}catch(e){'(sem resultado)'}")
+          {
+            echo "## EliteTube $VERSAO no Mac, voz Francisca (nuvem). Esperado: $ESPERA"
+            echo ""
+            echo "- aviso da tela: $AVISO"
+            echo "- whisper (base) ouviu: $OUVIU"
+            echo "- registro da montagem: $( [ -n "$L" ] && grep -E 'montagem' "$L" | tail -3 | tr '\n' ' ' )"
+          } >> "$GITHUB_STEP_SUMMARY"
